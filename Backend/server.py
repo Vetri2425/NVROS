@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import eventlet
 eventlet.monkey_patch()  # <-- ADD THIS LINE
 import threading
@@ -6,6 +8,8 @@ import math
 import json
 import base64
 import socket
+import sys
+import tempfile
 from collections import deque
 from itertools import count
 from flask import Flask, request, jsonify, Response
@@ -13,10 +17,15 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 from pymavlink.dialects.v20 import common as mavlink
 from dataclasses import dataclass, asdict, field
-from typing import Optional, List
+from typing import Optional, List, TextIO
 import os
 import atexit
 import signal
+
+try:
+    import fcntl  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - Windows lacks fcntl
+    fcntl = None  # type: ignore
 
 try:
     # When running as a package (e.g., python -m Backend.server)
@@ -31,134 +40,170 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
                     ping_timeout=60, ping_interval=25)
 
-# ROS2 Node for telemetry
-import rclpy
-from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import String
+ROS_DISTRO = os.environ.get('ROS_DISTRO', 'humble')
+_ros_lib_dir = f"/opt/ros/{ROS_DISTRO}/lib"
+if os.path.isdir(_ros_lib_dir):
+    _existing_ld = os.environ.get('LD_LIBRARY_PATH', '')
+    if _ros_lib_dir not in _existing_ld.split(':'):
+        _patched_ld = ':'.join(filter(None, [_ros_lib_dir, _existing_ld]))
+        os.environ['LD_LIBRARY_PATH'] = _patched_ld
+
+ROS_AVAILABLE = False
+ROS_IMPORT_ERROR: Exception | None = None
+telemetry_bridge = None
+command_bridge: Optional["CommandBridge"] = None
+# Executor may be created only when ROS is available.
+_ros_executor: Optional["MultiThreadedExecutor"] = None # type: ignore
+ros_thread: Optional[threading.Thread] = None
+_singleton_lock_handle: Optional[TextIO] = None
 
 try:
-    from mavros_msgs.srv import CommandBool, SetMode
-except ImportError:
+    import rclpy  # type: ignore
+    from rclpy.node import Node  # type: ignore
+    from rclpy.executors import MultiThreadedExecutor  # type: ignore
+    from std_msgs.msg import String  # type: ignore
+
+    try:
+        from mavros_msgs.srv import CommandBool, SetMode  # type: ignore
+    except ImportError:
+        CommandBool = None  # type: ignore
+        SetMode = None  # type: ignore
+
+    ROS_AVAILABLE = True
+except Exception as exc:
+    rclpy = None  # type: ignore
+    Node = None  # type: ignore
+    MultiThreadedExecutor = None  # type: ignore
+    String = None  # type: ignore
     CommandBool = None  # type: ignore
     SetMode = None  # type: ignore
+    ROS_IMPORT_ERROR = exc
+    print(f"[WARN] ROS2 support disabled: {exc}", flush=True)
 
-class TelemetryBridge(Node):
-    def __init__(self):
-        super().__init__('telemetry_bridge')
-        self.subscription = self.create_subscription(
-            String,
-            '/nrp/telemetry',
-            self.telemetry_callback,
-            10
-        )
-    
-    def telemetry_callback(self, msg):
-        global _last_telemetry_activity_log
-        try:
-            telemetry_data = json.loads(msg.data)
-            # Removed direct emit of 'telemetry' event to avoid redundant/partial updates
-            # socketio.emit('telemetry', telemetry_data)
-            _merge_ros2_telemetry(telemetry_data)
-            now = time.time()
-            if now - _last_telemetry_activity_log >= TELEMETRY_ACTIVITY_INTERVAL:
-                record_activity(
-                    "Forwarded telemetry update to frontend",
-                    level='DEBUG',
-                    event_type='ros_topic',
-                    meta={
-                        'topic': '/nrp/telemetry',
-                        'field_count': len(telemetry_data) if isinstance(telemetry_data, dict) else None,
-                        'fields': sorted(list(telemetry_data.keys()))[:10] if isinstance(telemetry_data, dict) else None,
-                    }
-                )
-                _last_telemetry_activity_log = now
-        except Exception as e:
-            log_message(f"Error processing telemetry: {e}", "ERROR", event_type='ros_topic')
+if ROS_AVAILABLE:
 
-class CommandBridge(Node):
-    def __init__(self):
-        if CommandBool is None or SetMode is None:
-            raise RuntimeError("mavros_msgs.srv not available; CommandBridge disabled")
-        super().__init__('command_bridge')
-        self._lock = threading.Lock()
-        self._set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
-        self._arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
+    class TelemetryBridge(Node):  # type: ignore[misc]
+        def __init__(self):
+            super().__init__('telemetry_bridge')
+            self.subscription = self.create_subscription(
+                String,
+                '/nrp/telemetry',
+                self.telemetry_callback,
+                10
+            )
 
-    def _call_service(self, client, request, timeout: float) -> object:
-        if client is None:
-            raise RuntimeError("ROS2 client is not initialized")
+        def telemetry_callback(self, msg):
+            global _last_telemetry_activity_log
+            try:
+                telemetry_data = json.loads(msg.data)
+                # Removed direct emit of 'telemetry' event to avoid redundant/partial updates
+                # socketio.emit('telemetry', telemetry_data)
+                _merge_ros2_telemetry(telemetry_data)
+                now = time.time()
+                if now - _last_telemetry_activity_log >= TELEMETRY_ACTIVITY_INTERVAL:
+                    record_activity(
+                        "Forwarded telemetry update to frontend",
+                        level='DEBUG',
+                        event_type='ros_topic',
+                        meta={
+                            'topic': '/nrp/telemetry',
+                            'field_count': len(telemetry_data) if isinstance(telemetry_data, dict) else None,
+                            'fields': sorted(list(telemetry_data.keys()))[:10] if isinstance(telemetry_data, dict) else None,
+                        }
+                    )
+                    _last_telemetry_activity_log = now
+            except Exception as e:
+                log_message(f"Error processing telemetry: {e}", "ERROR", event_type='ros_topic')
 
-        service_name = getattr(client, 'srv_name', 'unknown service')
+    class CommandBridge(Node):  # type: ignore[misc]
+        def __init__(self):
+            if CommandBool is None or SetMode is None:
+                raise RuntimeError("mavros_msgs.srv not available; CommandBridge disabled")
+            super().__init__('command_bridge')
+            self._lock = threading.Lock()
+            self._set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
+            self._arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
 
-        with self._lock:
-            if not client.wait_for_service(timeout_sec=timeout):
-                raise TimeoutError(f"Service {service_name} not available")
+        def _call_service(self, client, request, timeout: float) -> object:
+            if client is None:
+                raise RuntimeError("ROS2 client is not initialized")
 
-            future = client.call_async(request)
+            service_name = getattr(client, 'srv_name', 'unknown service')
 
-        deadline = time.time() + max(timeout, 0.1)
-        while time.time() < deadline:
-            if future.done():
-                result = future.result()
-                if result is not None:
-                    return result
-                exc = future.exception()
-                if exc:
-                    raise exc
-                raise RuntimeError("Service call returned no result")
-            time.sleep(0.01)
+            with self._lock:
+                if not client.wait_for_service(timeout_sec=timeout):
+                    raise TimeoutError(f"Service {service_name} not available")
 
-        raise TimeoutError(f"Service {service_name} timed out")
+                future = client.call_async(request)
 
-    def set_mode(self, *, mode: str, base_mode: int = 0, timeout: float = 5.0) -> dict:
-        request = SetMode.Request()
-        request.base_mode = int(base_mode)
-        request.custom_mode = str(mode)
-        response = self._call_service(self._set_mode_client, request, timeout)
-        return {
-            'success': bool(getattr(response, 'success', False)),
-            'mode_sent': bool(getattr(response, 'mode_sent', False)),
-        }
+            deadline = time.time() + max(timeout, 0.1)
+            while time.time() < deadline:
+                if future.done():
+                    result = future.result()
+                    if result is not None:
+                        return result
+                    exc = future.exception()
+                    if exc:
+                        raise exc
+                    raise RuntimeError("Service call returned no result")
+                time.sleep(0.01)
 
-    def arm(self, *, value: bool, timeout: float = 5.0) -> dict:
-        request = CommandBool.Request()
-        request.value = bool(value)
-        response = self._call_service(self._arm_client, request, timeout)
-        return {
-            'success': bool(getattr(response, 'success', False)),
-            'result': bool(getattr(response, 'result', False)),
-        }
+            raise TimeoutError(f"Service {service_name} timed out")
 
-# Initialize ROS2 bridge
-rclpy.init()
-telemetry_bridge = TelemetryBridge()
-command_bridge: Optional[CommandBridge]
-try:
-    command_bridge = CommandBridge()
-except Exception as exc:
-    print(f"Failed to initialize CommandBridge: {exc}", flush=True)
-    command_bridge = None
+        def set_mode(self, *, mode: str, base_mode: int = 0, timeout: float = 5.0) -> dict:
+            request = SetMode.Request()
+            request.base_mode = int(base_mode)
+            request.custom_mode = str(mode)
+            response = self._call_service(self._set_mode_client, request, timeout)
+            return {
+                'success': bool(getattr(response, 'success', False)),
+                'mode_sent': bool(getattr(response, 'mode_sent', False)),
+            }
 
-_ros_executor = MultiThreadedExecutor()
-_ros_executor.add_node(telemetry_bridge)
-if command_bridge is not None:
-    _ros_executor.add_node(command_bridge)
+        def arm(self, *, value: bool, timeout: float = 5.0) -> dict:
+            request = CommandBool.Request()
+            request.value = bool(value)
+            response = self._call_service(self._arm_client, request, timeout)
+            return {
+                'success': bool(getattr(response, 'success', False)),
+                'result': bool(getattr(response, 'result', False)),
+            }
 
-def _ros_executor_spin() -> None:
-    """Run the ROS executor until shutdown, ignoring Ctrl-C noise."""
+    # Initialize ROS2 bridge
+    rclpy.init()
+    telemetry_bridge = TelemetryBridge()
     try:
-        _ros_executor.spin()
-    except KeyboardInterrupt:
-        # Suppress noisy stack traces when the process is interrupted.
-        pass
+        command_bridge = CommandBridge()
     except Exception as exc:
-        print(f"[ROS] executor thread error: {exc}", flush=True)
+        print(f"Failed to initialize CommandBridge: {exc}", flush=True)
+        command_bridge = None
 
+    _ros_executor = MultiThreadedExecutor()
+    _ros_executor.add_node(telemetry_bridge)
+    if command_bridge is not None:
+        _ros_executor.add_node(command_bridge)
 
-ros_thread = threading.Thread(target=_ros_executor_spin)
-ros_thread.daemon = True
-ros_thread.start()
+    def _ros_executor_spin() -> None:
+        """Run the ROS executor until shutdown, ignoring Ctrl-C noise."""
+        try:
+            _ros_executor.spin()  # type: ignore[union-attr]
+        except KeyboardInterrupt:
+            # Suppress noisy stack traces when the process is interrupted.
+            pass
+        except Exception as exc:
+            print(f"[ROS] executor thread error: {exc}", flush=True)
+
+    ros_thread = threading.Thread(target=_ros_executor_spin)
+    ros_thread.daemon = True
+    ros_thread.start()
+else:
+
+    class CommandBridge:  # type: ignore[no-redef]
+        """ROS2 disabled placeholder to keep type-checkers satisfied."""
+
+        def __init__(self):
+            raise RuntimeError("ROS2 stack not available")
+
 
 _ros_shutdown_lock = threading.Lock()
 _ros_shutdown_done = False
@@ -173,28 +218,32 @@ def _shutdown_ros_runtime() -> None:
         _ros_shutdown_done = True
 
     try:
-        _ros_executor.shutdown()
+        if _ros_executor is not None:
+            _ros_executor.shutdown()
     except Exception:
         pass
 
     try:
-        if ros_thread.is_alive() and threading.current_thread() is not ros_thread:
+        if ros_thread is not None and ros_thread.is_alive() and threading.current_thread() is not ros_thread:
             ros_thread.join(timeout=2.0)
     except Exception:
         pass
 
     try:
-        _ros_executor.remove_node(telemetry_bridge)
+        if _ros_executor is not None and telemetry_bridge is not None:
+            _ros_executor.remove_node(telemetry_bridge)
     except Exception:
         pass
     try:
-        telemetry_bridge.destroy_node()
+        if telemetry_bridge is not None:
+            telemetry_bridge.destroy_node()
     except Exception:
         pass
 
     if command_bridge is not None:
         try:
-            _ros_executor.remove_node(command_bridge)
+            if _ros_executor is not None:
+                _ros_executor.remove_node(command_bridge)
         except Exception:
             pass
         try:
@@ -209,14 +258,75 @@ def _shutdown_ros_runtime() -> None:
         pass
 
     try:
-        rclpy.shutdown()
+        if ROS_AVAILABLE and rclpy is not None:
+            rclpy.shutdown()
     except Exception:
         pass
+
+    if fcntl is not None:
+        global _singleton_lock_handle
+        if _singleton_lock_handle is not None:
+            try:
+                fcntl.flock(_singleton_lock_handle, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                _singleton_lock_handle.close()
+            except Exception:
+                pass
+            _singleton_lock_handle = None
 
 
 atexit.register(_shutdown_ros_runtime)
 
+
+def _acquire_singleton_lock() -> None:
+    """Prevent multiple backend instances from sharing the same TCP port."""
+    global _singleton_lock_handle
+
+    if fcntl is None:
+        return  # Platform without fcntl cannot rely on this lock; fall back to best effort.
+
+    lock_path = os.environ.get('NRP_BACKEND_LOCK_FILE')
+    if not lock_path:
+        lock_path = os.path.join(tempfile.gettempdir(), 'nrp_backend.lock')
+
+    try:
+        handle = open(lock_path, 'w')
+    except Exception as exc:
+        print(f"[WARN] Unable to open backend lock file {lock_path}: {exc}", flush=True)
+        return
+
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"[WARN] Another NRP backend instance is already running (lock {lock_path}). Exiting duplicate.", flush=True)
+        try:
+            handle.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except Exception as exc:
+        print(f"[WARN] Unable to lock backend file {lock_path}: {exc}", flush=True)
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        handle.truncate(0)
+        handle.write(str(os.getpid()))
+        handle.flush()
+    except Exception:
+        pass
+
+    _singleton_lock_handle = handle
+
+
 # --- MAVROS Connection Configuration ---
+_acquire_singleton_lock()
+
 os.environ["MAVROS_BRIDGE_HOST"] = "127.0.0.1"    # Local MAVROS instance
 os.environ["MAVROS_BRIDGE_PORT"] = "9090"         # rosbridge_server WebSocket port
 os.environ["MAVROS_FCU_URL"] = "/dev/ttyACM0:115200"  # Rover connection parameters
@@ -301,7 +411,7 @@ activity_log: deque[dict] = deque(maxlen=ACTIVITY_LOG_MAX)
 _activity_log_lock = threading.Lock()
 _activity_seq = count(1)
 TELEMETRY_ACTIVITY_INTERVAL = float(os.getenv('TELEMETRY_ACTIVITY_INTERVAL', '5.0'))
-_last_telemetry_activity_log = 0.0
+_last_telemetry_activity_log: float = 0.0
 
 def _make_json_safe(obj, depth: int = 2):
     """Return a JSON-serialisable version of obj, truncating deeply nested data."""
@@ -406,6 +516,14 @@ def log_message(message, level='INFO', event_type: str = 'general', meta=None):
             print(f"[LOG-ERR] {message}", flush=True)
         except Exception:
             pass
+
+if not ROS_AVAILABLE and ROS_IMPORT_ERROR is not None:
+    log_message(
+        f"ROS2 features disabled: {ROS_IMPORT_ERROR}",
+        level='WARNING',
+        event_type='startup',
+        meta={'ros_distro': ROS_DISTRO}
+    )
 
 
 @app.before_request
