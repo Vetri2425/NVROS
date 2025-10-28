@@ -35,6 +35,57 @@ export interface MissionLog {
   entries: LogEntry[];
 }
 
+/**
+ * A single, unified data structure for all rover data,
+ * combining real telemetry with UI-specific values.
+ */
+export interface RoverData {
+  // --- Core Connection & Mode ---
+  connected: boolean;
+  mode: string;
+  status: 'armed' | 'disarmed';
+  
+  // --- Position & Navigation ---
+  position: { lat: number; lng: number } | null;
+  latitude?: number;
+  longitude?: number;
+  altitude?: number;
+  relative_altitude?: number;
+  heading: number;
+  groundspeed?: number;
+  
+  // --- GPS & RTK Status ---
+  rtk_status: string;
+  fix_type?: number;
+  satellites_visible?: number;
+  hrms: string | number;
+  vrms: string | number;
+  
+  // --- System Status ---
+  battery: number;
+  voltage?: number;
+  current?: number;
+  cpu_load?: number;
+  drop_rate?: number;
+  rc_connected: boolean;
+  signal_strength: string;
+  imu_status: string;
+  
+  // --- Mission Progress ---
+  mission_progress?: {
+    current: number;
+    total: number;
+  };
+  current_waypoint_id: number | null;
+  activeWaypointIndex: number | null;
+  completedWaypointIds: number[];
+  distanceToNext: number;
+  
+  // --- Metadata ---
+  lastUpdate: string | number;
+  telemetryAgeMs?: number;
+}
+
 export type Waypoint = {
   id: number;
   command: string;
@@ -52,31 +103,3 @@ export type Waypoint = {
 };
 
 export type ViewMode = 'dashboard' | 'planning' | 'live' | 'logs' | 'map' | 'setup' | 'servo';
-
-/**
- * A single, unified data structure for all rover data,
- * combining real telemetry with UI-specific values.
- * This is now the single source of truth, replacing LiveRoverData.
- */
-export interface RoverData {
-  // --- Core Telemetry from Backend ---
-  position: { lat: number; lng: number } | null;
-  heading: number;
-  battery: number;
-  status: 'armed' | 'disarmed';
-  mode: string;
-  rtk_status: string;
-  signal_strength: string;
-  current_waypoint_id: number | null;
-  rc_connected: boolean; // RC connection status
-
-  // --- UI / Live Report Values ---
-  hrms: string | number;
-  vrms: string | number;
-  imu_status: string;
-  activeWaypointIndex: number | null;
-  completedWaypointIds: number[];
-  distanceToNext: number;
-  lastUpdate?: string;
-  telemetryAgeMs?: number;
-}

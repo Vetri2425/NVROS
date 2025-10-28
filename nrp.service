@@ -1,0 +1,18 @@
+[Unit]
+Description=NRP (Navigation Rover Platform) Service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=flash
+WorkingDirectory=/home/flash/NRP
+Environment=PATH=/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages
+ExecStart=/home/flash/NRP/start_service.sh
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

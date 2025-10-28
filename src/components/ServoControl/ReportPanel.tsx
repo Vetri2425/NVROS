@@ -2,7 +2,8 @@
 import React from "react";
 
 export default function ReportPanel({ status }: any) {
-  const active = Object.entries(status as any).find(([_, s]: any) => s?.running);
+  const entries = Object.entries((status ?? {}) as Record<string, any>);
+  const active = entries.find(([, s]) => s?.running) as [string, any] | undefined;
   return (
     <div className="bg-slate-800 border border-slate-700 p-4 rounded-lg mt-4">
       <h3 className="font-semibold mb-2 text-slate-200">Report Summary</h3>

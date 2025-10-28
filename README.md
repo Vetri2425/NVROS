@@ -46,3 +46,5 @@ Open the provided Vite dev server URL in your browser to use the planner.
 ## Deploy
 
 Deploy the frontend as you would a standard Vite React app. Host the Python backend separately close to your rover control network, keeping the Socket.IO endpoint accessible to the UI.
+# NRP_ROS
+# NRP_ROS

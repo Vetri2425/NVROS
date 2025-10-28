@@ -7,25 +7,23 @@ import json
 import base64
 import socket
 from collections import deque
-from flask import Flask, request, jsonify
+from itertools import count
+from flask import Flask, request, jsonify, Response
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 from pymavlink.dialects.v20 import common as mavlink
 from dataclasses import dataclass, asdict, field
 from typing import Optional, List
 import os
+import atexit
 import signal
 
 try:
     # When running as a package (e.g., python -m Backend.server)
-    from .mavlink_core import get_mavlink_core  # type: ignore
+    from .mavros_bridge import MavrosBridge  # type: ignore
 except Exception:
     # When running as a script from the Backend directory
-    from mavlink_core import get_mavlink_core  # type: ignore
-
-# --- Configuration ---
-CONNECTION_STRING = 'udp:127.0.0.1:14551'  # Default connection string (can be overridden)
-BAUD_RATE = 115200
+    from mavros_bridge import MavrosBridge  # type: ignore
 
 # --- Flask & SocketIO Setup ---
 app = Flask(__name__)
@@ -33,11 +31,205 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
                     ping_timeout=60, ping_interval=25)
 
-# --- MAVLink Connection ---
-master = None
+# ROS2 Node for telemetry
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from std_msgs.msg import String
+
+try:
+    from mavros_msgs.srv import CommandBool, SetMode
+except ImportError:
+    CommandBool = None  # type: ignore
+    SetMode = None  # type: ignore
+
+class TelemetryBridge(Node):
+    def __init__(self):
+        super().__init__('telemetry_bridge')
+        self.subscription = self.create_subscription(
+            String,
+            '/nrp/telemetry',
+            self.telemetry_callback,
+            10
+        )
+    
+    def telemetry_callback(self, msg):
+        global _last_telemetry_activity_log
+        try:
+            telemetry_data = json.loads(msg.data)
+            # Removed direct emit of 'telemetry' event to avoid redundant/partial updates
+            # socketio.emit('telemetry', telemetry_data)
+            _merge_ros2_telemetry(telemetry_data)
+            now = time.time()
+            if now - _last_telemetry_activity_log >= TELEMETRY_ACTIVITY_INTERVAL:
+                record_activity(
+                    "Forwarded telemetry update to frontend",
+                    level='DEBUG',
+                    event_type='ros_topic',
+                    meta={
+                        'topic': '/nrp/telemetry',
+                        'field_count': len(telemetry_data) if isinstance(telemetry_data, dict) else None,
+                        'fields': sorted(list(telemetry_data.keys()))[:10] if isinstance(telemetry_data, dict) else None,
+                    }
+                )
+                _last_telemetry_activity_log = now
+        except Exception as e:
+            log_message(f"Error processing telemetry: {e}", "ERROR", event_type='ros_topic')
+
+class CommandBridge(Node):
+    def __init__(self):
+        if CommandBool is None or SetMode is None:
+            raise RuntimeError("mavros_msgs.srv not available; CommandBridge disabled")
+        super().__init__('command_bridge')
+        self._lock = threading.Lock()
+        self._set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
+        self._arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
+
+    def _call_service(self, client, request, timeout: float) -> object:
+        if client is None:
+            raise RuntimeError("ROS2 client is not initialized")
+
+        service_name = getattr(client, 'srv_name', 'unknown service')
+
+        with self._lock:
+            if not client.wait_for_service(timeout_sec=timeout):
+                raise TimeoutError(f"Service {service_name} not available")
+
+            future = client.call_async(request)
+
+        deadline = time.time() + max(timeout, 0.1)
+        while time.time() < deadline:
+            if future.done():
+                result = future.result()
+                if result is not None:
+                    return result
+                exc = future.exception()
+                if exc:
+                    raise exc
+                raise RuntimeError("Service call returned no result")
+            time.sleep(0.01)
+
+        raise TimeoutError(f"Service {service_name} timed out")
+
+    def set_mode(self, *, mode: str, base_mode: int = 0, timeout: float = 5.0) -> dict:
+        request = SetMode.Request()
+        request.base_mode = int(base_mode)
+        request.custom_mode = str(mode)
+        response = self._call_service(self._set_mode_client, request, timeout)
+        return {
+            'success': bool(getattr(response, 'success', False)),
+            'mode_sent': bool(getattr(response, 'mode_sent', False)),
+        }
+
+    def arm(self, *, value: bool, timeout: float = 5.0) -> dict:
+        request = CommandBool.Request()
+        request.value = bool(value)
+        response = self._call_service(self._arm_client, request, timeout)
+        return {
+            'success': bool(getattr(response, 'success', False)),
+            'result': bool(getattr(response, 'result', False)),
+        }
+
+# Initialize ROS2 bridge
+rclpy.init()
+telemetry_bridge = TelemetryBridge()
+command_bridge: Optional[CommandBridge]
+try:
+    command_bridge = CommandBridge()
+except Exception as exc:
+    print(f"Failed to initialize CommandBridge: {exc}", flush=True)
+    command_bridge = None
+
+_ros_executor = MultiThreadedExecutor()
+_ros_executor.add_node(telemetry_bridge)
+if command_bridge is not None:
+    _ros_executor.add_node(command_bridge)
+
+def _ros_executor_spin() -> None:
+    """Run the ROS executor until shutdown, ignoring Ctrl-C noise."""
+    try:
+        _ros_executor.spin()
+    except KeyboardInterrupt:
+        # Suppress noisy stack traces when the process is interrupted.
+        pass
+    except Exception as exc:
+        print(f"[ROS] executor thread error: {exc}", flush=True)
+
+
+ros_thread = threading.Thread(target=_ros_executor_spin)
+ros_thread.daemon = True
+ros_thread.start()
+
+_ros_shutdown_lock = threading.Lock()
+_ros_shutdown_done = False
+
+
+def _shutdown_ros_runtime() -> None:
+    """Best-effort cleanup for ROS resources when the process exits."""
+    global _ros_shutdown_done
+    with _ros_shutdown_lock:
+        if _ros_shutdown_done:
+            return
+        _ros_shutdown_done = True
+
+    try:
+        _ros_executor.shutdown()
+    except Exception:
+        pass
+
+    try:
+        if ros_thread.is_alive() and threading.current_thread() is not ros_thread:
+            ros_thread.join(timeout=2.0)
+    except Exception:
+        pass
+
+    try:
+        _ros_executor.remove_node(telemetry_bridge)
+    except Exception:
+        pass
+    try:
+        telemetry_bridge.destroy_node()
+    except Exception:
+        pass
+
+    if command_bridge is not None:
+        try:
+            _ros_executor.remove_node(command_bridge)
+        except Exception:
+            pass
+        try:
+            command_bridge.destroy_node()
+        except Exception:
+            pass
+
+    try:
+        if mavros_bridge is not None:
+            mavros_bridge.close()
+    except Exception:
+        pass
+
+    try:
+        rclpy.shutdown()
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_ros_runtime)
+
+# --- MAVROS Connection Configuration ---
+os.environ["MAVROS_BRIDGE_HOST"] = "127.0.0.1"    # Local MAVROS instance
+os.environ["MAVROS_BRIDGE_PORT"] = "9090"         # rosbridge_server WebSocket port
+os.environ["MAVROS_FCU_URL"] = "/dev/ttyACM0:115200"  # Rover connection parameters
+
+# --- MAVROS Connection ---
+mavros_bridge: Optional[MavrosBridge] = None
 is_vehicle_connected = False
 current_mission = []  # Store current mission waypoints
+mavros_bridge_lock = threading.Lock()
+mavros_telem_lock = threading.Lock()
+mavros_connection_last_attempt = 0.0
 
+ 
 
 @dataclass
 class Position:
@@ -76,8 +268,6 @@ class CurrentState:
 # Initialize current vehicle state
 current_state = CurrentState()
 
-pending_command_queue: deque[dict] = deque()
-mavlink_io_lock = threading.Lock()
 mission_upload_lock = threading.Lock()
 mission_download_lock = threading.Lock()
 
@@ -99,16 +289,67 @@ last_emit_monotonic = 0.0
 _emit_lock = threading.Lock()
 _emit_timer: Optional[object] = None
 
-# Pending ACK waiters
-_ack_waiters_lock = threading.Lock()
-_ack_waiters: dict[str, list[dict]] = {}
-
 MISSION_LOG_HISTORY_MAX = 1000
 mission_log_history: deque[dict] = deque(maxlen=MISSION_LOG_HISTORY_MAX)
 mission_log_state = {
     'last_active_seq': None,
     'last_reached_seq': None,
 }
+
+ACTIVITY_LOG_MAX = int(os.getenv('ACTIVITY_LOG_MAX', '2000'))
+activity_log: deque[dict] = deque(maxlen=ACTIVITY_LOG_MAX)
+_activity_log_lock = threading.Lock()
+_activity_seq = count(1)
+TELEMETRY_ACTIVITY_INTERVAL = float(os.getenv('TELEMETRY_ACTIVITY_INTERVAL', '5.0'))
+_last_telemetry_activity_log = 0.0
+
+def _make_json_safe(obj, depth: int = 2):
+    """Return a JSON-serialisable version of obj, truncating deeply nested data."""
+    try:
+        if depth < 0:
+            return str(obj)
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, dict):
+            limited = {}
+            for idx, (key, value) in enumerate(obj.items()):
+                if idx >= 15:
+                    limited["..."] = f"+{len(obj) - idx} more"
+                    break
+                limited[str(key)] = _make_json_safe(value, depth - 1)
+            return limited
+        if isinstance(obj, (list, tuple, set)):
+            seq = list(obj)
+            limited = [_make_json_safe(value, depth - 1) for value in seq[:15]]
+            if len(seq) > 15:
+                limited.append(f"... (+{len(seq) - 15} more)")
+            return limited
+        return json.loads(json.dumps(obj))
+    except Exception:
+        return str(obj)
+
+def record_activity(message: str, *, level: str = 'INFO', event_type: str = 'general', meta: dict | list | str | int | float | None = None):
+    """Store and broadcast backend activity events."""
+    timestamp = time.time()
+    entry = {
+        'id': next(_activity_seq),
+        'timestamp': timestamp,
+        'isoTime': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(timestamp)),
+        'level': str(level),
+        'event': str(event_type),
+        'message': str(message),
+        'meta': _make_json_safe(meta),
+    }
+    try:
+        with _activity_log_lock:
+            activity_log.append(entry)
+    except Exception:
+        pass
+    try:
+        socketio.emit('server_activity', entry)
+    except Exception:
+        pass
+    return entry
 
 COMMAND_ID_TO_NAME = {
     mavlink.MAV_CMD_COMPONENT_ARM_DISARM: 'ARM_DISARM',
@@ -130,15 +371,6 @@ COMMAND_NAME_TO_ID = {
     'CONDITION_DELAY': mavlink.MAV_CMD_CONDITION_DELAY,
 }
 
-COMMAND_RESULT_MAP = {
-    mavlink.MAV_RESULT_ACCEPTED: ('success', 'Command accepted'),
-    mavlink.MAV_RESULT_TEMPORARILY_REJECTED: ('error', 'Command temporarily rejected'),
-    mavlink.MAV_RESULT_DENIED: ('error', 'Command denied'),
-    mavlink.MAV_RESULT_UNSUPPORTED: ('error', 'Command unsupported'),
-    mavlink.MAV_RESULT_FAILED: ('error', 'Command failed'),
-    mavlink.MAV_RESULT_IN_PROGRESS: ('pending', 'Command in progress'),
-}
-
 # Mode mappings
 COPTER_MODES = {
     0: 'STABILIZE', 1: 'ACRO', 2: 'ALT_HOLD', 3: 'AUTO', 4: 'GUIDED',
@@ -158,9 +390,10 @@ ROVER_MODES = {
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def log_message(message, level='INFO'):
-    """Simple logger that prints to stdout and emits to frontend."""
+def log_message(message, level='INFO', event_type: str = 'general', meta=None):
+    """Simple logger that prints to stdout, stores activity, and emits to frontend."""
     try:
+        record_activity(message, level=level, event_type=event_type, meta=meta)
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
         text = f"[{ts}] [{level}] {message}"
         print(text, flush=True)
@@ -171,8 +404,58 @@ def log_message(message, level='INFO'):
     except Exception:
         try:
             print(f"[LOG-ERR] {message}", flush=True)
-        except:
+        except Exception:
             pass
+
+
+@app.before_request
+def _track_http_request():
+    """Record incoming HTTP requests (excluding Socket.IO transport noise)."""
+    try:
+        if request.path.startswith('/socket.io'):
+            return
+        meta: dict[str, object] = {
+            'method': request.method,
+            'path': request.path,
+            'args': request.args.to_dict(flat=True),
+        }
+        if request.method in ('POST', 'PUT', 'PATCH'):
+            body = request.get_json(silent=True)
+            if isinstance(body, dict):
+                meta['json_keys'] = sorted(list(body.keys()))[:15]
+                if 'waypoints' in body and isinstance(body['waypoints'], list):
+                    meta['waypoint_count'] = len(body['waypoints'])
+        event_type = 'ui_request' if request.path.startswith('/api/') else 'http_request'
+        record_activity(
+            f"HTTP {request.method} {request.path} request",
+            level='DEBUG',
+            event_type=event_type,
+            meta=meta
+        )
+    except Exception:
+        pass
+
+
+@app.after_request
+def _track_http_response(response):
+    """Record outgoing HTTP responses for observability."""
+    try:
+        if request.path.startswith('/socket.io'):
+            return response
+        level = 'INFO' if response.status_code < 400 else 'ERROR'
+        record_activity(
+            f"HTTP {request.method} {request.path} responded",
+            level=level,
+            event_type='server_response',
+            meta={
+                'status': response.status_code,
+                'content_type': response.content_type,
+                'length': response.content_length,
+            }
+        )
+    except Exception:
+        pass
+    return response
 
 
 def _current_position() -> tuple[float | None, float | None]:
@@ -216,6 +499,60 @@ def safe_float(value, default=0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _merge_ros2_telemetry(payload: dict) -> None:
+    """Merge telemetry published via the ROS2 bridge into the shared rover state."""
+    if not payload or not isinstance(payload, dict):
+        return
+    global is_vehicle_connected
+    changed = False
+    now = time.time()
+    try:
+        state = payload.get('state')
+        position = payload.get('position')
+
+        with mavros_telem_lock:
+            if isinstance(state, dict):
+                armed_flag = bool(state.get('armed'))
+                status = 'armed' if armed_flag else 'disarmed'
+                if status != current_state.status:
+                    current_state.status = status
+                    changed = True
+                connected = state.get('connected')
+                if isinstance(connected, bool) and connected != is_vehicle_connected:
+                    is_vehicle_connected = connected
+                    changed = True
+                mode = state.get('mode')
+                if isinstance(mode, str) and mode:
+                    normalized_mode = mode.upper()
+                    if normalized_mode != current_state.mode:
+                        current_state.mode = normalized_mode
+                        changed = True
+                heartbeat_ms = state.get('heartbeat_ts')
+                if isinstance(heartbeat_ms, (int, float)) and heartbeat_ms > 0:
+                    current_state.last_heartbeat = float(heartbeat_ms) / 1000.0
+                system_status = state.get('system_status')
+                if isinstance(system_status, str) and system_status:
+                    current_state.signal_strength = derive_signal_strength(
+                        current_state.last_heartbeat,
+                        current_state.rc_connected
+                    )
+                current_state.last_update = now
+
+            if isinstance(position, dict):
+                lat = position.get('latitude')
+                lon = position.get('longitude')
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                    current_state.position = Position(lat=float(lat), lng=float(lon))
+                    changed = True
+                    current_state.last_update = now
+    except Exception as exc:
+        log_message(f"Failed to merge ROS2 telemetry: {exc}", "WARNING", event_type='ros_topic')
+        return
+
+    if changed:
+        schedule_fast_emit()
 
 
 # ============================================================
@@ -418,6 +755,82 @@ def get_mode_number(mode_name, vehicle_type='ROVER'):
     return None
 
 
+def _map_navsat_status(status_code: Optional[int]) -> str:
+    """Map sensor_msgs/NavSatStatus codes to human readable text."""
+    mapping = {
+        None: 'Unknown',
+        -1: 'No Fix',
+        0: 'GPS Fix',
+        1: 'DGPS',
+        2: 'RTK Fixed',
+        3: 'RTK Float',
+    }
+    return mapping.get(status_code, f"Status {status_code}")
+
+
+def _convert_mavros_waypoints_to_ui(waypoints: List[dict]) -> List[dict]:
+    """Convert MAVROS waypoint dictionaries into the UI mission format."""
+    converted: List[dict] = []
+    for idx, wp in enumerate(waypoints or []):
+        try:
+            cmd = int(wp.get("command", mavlink.MAV_CMD_NAV_WAYPOINT))
+        except Exception:
+            cmd = mavlink.MAV_CMD_NAV_WAYPOINT
+        converted.append({
+            "id": idx + 1,
+            "command": 'WAYPOINT' if cmd == mavlink.MAV_CMD_NAV_WAYPOINT else COMMAND_ID_TO_NAME.get(cmd, f'COMMAND_{cmd}'),
+            "lat": safe_float(wp.get("x_lat", 0.0)),
+            "lng": safe_float(wp.get("y_long", 0.0)),
+            "alt": safe_float(wp.get("z_alt", 0.0)),
+            "frame": int(safe_float(wp.get("frame", mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT),
+                                   mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT)),
+            "param1": safe_float(wp.get("param1", 0.0)),
+            "param2": safe_float(wp.get("param2", 0.0)),
+            "param3": safe_float(wp.get("param3", 0.0)),
+            "param4": safe_float(wp.get("param4", 0.0)),
+            "autocontinue": int(safe_float(wp.get("autocontinue", 1), 1)),
+        })
+    return converted
+
+
+def _build_mavros_waypoints(waypoints: List[dict]) -> List[dict]:
+    """Translate UI waypoint dictionaries into MAVROS Waypoint structures."""
+    mavros_waypoints: List[dict] = []
+    for idx, wp in enumerate(waypoints):
+        command_id = resolve_mav_command(wp.get("command"))
+        frame = int(safe_float(wp.get("frame", mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT),
+                               mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT))
+        autocontinue = int(bool(safe_float(wp.get("autocontinue", 1), 1)))
+        param1 = safe_float(wp.get("param1", 0.0))
+        param2 = safe_float(wp.get("param2", 0.0))
+        param3 = safe_float(wp.get("param3", 0.0))
+        param4 = safe_float(wp.get("param4", 0.0))
+
+        if command_requires_nav_coordinates(command_id):
+            lat = safe_float(wp.get("lat", wp.get("x", 0.0)))
+            lon = safe_float(wp.get("lng", wp.get("y", 0.0)))
+            alt = safe_float(wp.get("alt", wp.get("z", 0.0)))
+        else:
+            lat = safe_float(wp.get("x", 0.0))
+            lon = safe_float(wp.get("y", 0.0))
+            alt = safe_float(wp.get("alt", wp.get("z", 0.0)))
+
+        mavros_waypoints.append({
+            "frame": frame,
+            "command": command_id,
+            "is_current": 1 if idx == 0 else 0,
+            "autocontinue": autocontinue,
+            "param1": param1,
+            "param2": param2,
+            "param3": param3,
+            "param4": param4,
+            "x_lat": lat,
+            "y_long": lon,
+            "z_alt": alt,
+        })
+    return mavros_waypoints
+
+
 def derive_signal_strength(last_heartbeat: float | None, rc_connected: bool) -> str:
     """Return a human readable link quality label for the UI."""
     if last_heartbeat is None:
@@ -432,82 +845,25 @@ def derive_signal_strength(last_heartbeat: float | None, rc_connected: bool) -> 
     return 'Lost'
 
 
-# ============================================================================
-# COMMAND QUEUE & ACK HANDLING
-# ============================================================================
+def _get_vehicle_bridge(*, require_vehicle: bool = True, timeout: float = 5.0) -> MavrosBridge:
+    """
+    Return a MAVROS bridge, optionally ensuring the rover reports as connected.
 
-def queue_pending_command(command_name: str, sid: str | None, message: str):
-    now = time.time()
-    while pending_command_queue and now - pending_command_queue[0]['timestamp'] > 30:
-        pending_command_queue.popleft()
-    entry = {
-        'command': command_name,
-        'sid': sid,
-        'timestamp': now,
-        'message': message,
-    }
-    pending_command_queue.append(entry)
-    if sid:
-        socketio.emit('command_response', {
-            'status': 'pending',
-            'command': command_name,
-            'message': message,
-        }, room=sid)
+    When attempting to arm/disarm the vehicle we may not yet have seen a telemetry
+    heartbeat, but the command can still succeed; allowing callers to bypass the
+    vehicle connectivity assertion prevents false negatives.
+    """
+    bridge = _init_mavros_bridge()
+    if not bridge.is_connected:
+        bridge.connect(timeout=timeout)
+    if require_vehicle and not is_vehicle_connected:
+        raise RuntimeError("Vehicle not connected")
+    return bridge
 
 
-def _notify_ack_waiters(command_name: str, response: dict) -> None:
-    """Notify any threads waiting for a COMMAND_ACK for this command."""
-    to_notify: list[dict] = []
-    with _ack_waiters_lock:
-        waiters = _ack_waiters.get(command_name)
-        if waiters:
-            to_notify = waiters[:]
-            _ack_waiters[command_name] = []
-    for w in to_notify:
-        try:
-            w['response'] = response
-            ev = w.get('event')
-            if ev is not None:
-                ev.set()
-        except Exception:
-            pass
-
-
-def wait_for_ack(command_name: str, timeout: float = 20.0) -> dict:
-    """Block until a COMMAND_ACK is received or timeout."""
-    event = threading.Event()
-    waiter = {'event': event, 'response': None}
-    with _ack_waiters_lock:
-        _ack_waiters.setdefault(command_name, []).append(waiter)
-    ok = event.wait(timeout)
-    if not ok:
-        with _ack_waiters_lock:
-            lst = _ack_waiters.get(command_name)
-            if lst and waiter in lst:
-                lst.remove(waiter)
-        return {
-            'status': 'error',
-            'command': command_name,
-            'message': f'Command timeout ({int(timeout)}s)'
-        }
-    return waiter.get('response') or {
-        'status': 'error',
-        'command': command_name,
-        'message': 'ACK wait returned no response'
-    }
-
-
-def resolve_pending_command(command_name: str, response: dict):
-    matched = None
-    for entry in list(pending_command_queue):
-        if entry['command'] == command_name:
-            matched = entry
-            pending_command_queue.remove(entry)
-            break
-    if matched and matched.get('sid'):
-        socketio.emit('command_response', response, room=matched['sid'])
-    else:
-        socketio.emit('command_response', response)
+def _require_vehicle_bridge() -> MavrosBridge:
+    """Backward-compatible helper enforcing a connected vehicle."""
+    return _get_vehicle_bridge(require_vehicle=True)
 
 
 # ============================================================================
@@ -565,357 +921,155 @@ def get_rover_data():
 # MAVLINK CONNECTION & MESSAGE PROCESSING
 # ============================================================================
 
-def connect_to_drone():
-    """Establishes and maintains the connection to the drone."""
-    global master, is_vehicle_connected
+def _init_mavros_bridge() -> MavrosBridge:
+    """Ensure a single MavrosBridge instance and attach telemetry subscriptions."""
+    global mavros_bridge
+    with mavros_bridge_lock:
+        if mavros_bridge is None:
+            log_message("Creating MAVROS bridge instance")
+            mavros_bridge = MavrosBridge()
+            mavros_bridge.subscribe_telemetry(_handle_mavros_telemetry)
+    return mavros_bridge
+
+
+def maintain_mavros_connection():
+    """Establish and monitor the MAVROS bridge connection."""
+    global is_vehicle_connected, mavros_connection_last_attempt
     while True:
         try:
-            if not is_vehicle_connected:
-                log_message(f"Attempting to connect to vehicle on: {CONNECTION_STRING}")
-                master = get_mavlink_core()
-                master.connect(CONNECTION_STRING, BAUD_RATE)
-                log_message("Waiting for heartbeat...")
-                master.wait_heartbeat(timeout=30)
-                is_vehicle_connected = True
-                log_message("Vehicle connected!", "SUCCESS")
-                log_message(f"Vehicle type: {master.target_system}")
-                try:
-                    set_message_intervals()
-                except Exception as e:
-                    log_message(f"Failed to set message intervals: {e}", "WARNING")
-                request_data_streams()
-                log_message("Emitting 'CONNECTED_TO_ROVER' to ALL clients...")
-                socketio.emit('connection_status', {'status': 'CONNECTED_TO_ROVER'})
-        except Exception as e:
-            if is_vehicle_connected:
-                log_message("Lost connection to vehicle.", "ERROR")
-                is_vehicle_connected = False
-                master = None
-                log_message("Emitting 'WAITING_FOR_ROVER' due to lost connection...")
-                socketio.emit('connection_status', {
-                    'status': 'WAITING_FOR_ROVER',
-                    'message': str(e)
-                })
-            log_message(f"Connection error: {e}", "ERROR")
-        socketio.sleep(5)
-
-
-def request_data_streams():
-    """Request data streams from the vehicle."""
-    if not master:
-        return
-
-    def _env_rate(name: str, default: float) -> int:
-        try:
-            val = float(os.getenv(name, str(default)))
-            return int(max(0, val))
-        except Exception:
-            return int(default)
-
-    streams = [
-        (mavlink.MAV_DATA_STREAM_POSITION, _env_rate('STREAM_POSITION_HZ', 20)),
-        (mavlink.MAV_DATA_STREAM_EXTRA1, _env_rate('STREAM_EXTRA1_HZ', 5)),
-        (mavlink.MAV_DATA_STREAM_EXTRA2, _env_rate('STREAM_EXTRA2_HZ', 5)),
-        (mavlink.MAV_DATA_STREAM_RC_CHANNELS, _env_rate('STREAM_RC_HZ', 5)),
-        (mavlink.MAV_DATA_STREAM_RAW_SENSORS, _env_rate('STREAM_RAW_SENSORS_HZ', 5))
-    ]
-    for stream_id, rate in streams:
-        try:
-            master.mav.request_data_stream_send(
-                master.target_system,
-                master.target_component,
-                stream_id,
-                rate,
-                1
-            )
-        except Exception as e:
-            log_message(f"Error requesting data stream {stream_id}: {e}", "ERROR")
-
-
-def set_message_intervals():
-    """Configure MAVLink message intervals for more reliable telemetry."""
-    if not master:
-        return
-
-    def send_interval(msg_id: int, hz: float):
-        try:
-            interval_us = int(1_000_000 / hz) if hz > 0 else -1
-            master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                0,
-                msg_id,
-                interval_us,
-                0, 0, 0, 0, 0
-            )
-        except Exception as e:
-            log_message(f"Failed to set interval for msg {msg_id}: {e}", "WARNING")
-
-    def _hz(name: str, default: float) -> float:
-        try:
-            return float(os.getenv(name, str(default)))
-        except Exception:
-            return default
-
-    send_interval(mavlink.MAVLINK_MSG_ID_HEARTBEAT, _hz('MAV_HEARTBEAT_HZ', 5))
-    send_interval(mavlink.MAVLINK_MSG_ID_COMMAND_ACK, _hz('MAV_CMD_ACK_HZ', 10))
-    send_interval(mavlink.MAVLINK_MSG_ID_SYS_STATUS, _hz('MAV_SYS_STATUS_HZ', 5))
-    send_interval(mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, _hz('MAV_GPOS_HZ', 20))
-    send_interval(mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, _hz('MAV_GPS_RAW_HZ', 5))
-
-
-def process_mavlink_messages():
-    """Process incoming MAVLink messages and update vehicle data."""
-    global current_state
-
-    while True:
-        if not is_vehicle_connected or not master:
-            socketio.sleep(0.1)
-            continue
-
-        try:
-            with mavlink_io_lock:
-                msg = master.recv_match(blocking=False, timeout=0.1)
-            if msg is None:
+            bridge = _init_mavros_bridge()
+            if bridge.is_connected:
+                socketio.sleep(2.0)
                 continue
 
-            msg_type = msg.get_type()
+            now = time.time()
+            if now - mavros_connection_last_attempt < 1.0:
+                socketio.sleep(1.0)
+                continue
 
-            if msg_type == 'HEARTBEAT':
-                old_status = current_state.status
-                old_mode = current_state.mode
-                current_state.last_heartbeat = time.time()
-                current_state.status = 'armed' if (
-                    msg.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                ) else 'disarmed'
-                current_state.mode = get_mode_name(msg.custom_mode)
-                if current_state.status != old_status or current_state.mode != old_mode:
-                    try:
-                        current_state.last_update = time.time()
-                    except Exception:
-                        pass
-                    log_message(
-                        f"MODE/STATUS CHANGED: {old_mode}->{current_state.mode}, "
-                        f"{old_status}->{current_state.status}",
-                        "SUCCESS"
-                    )
-                    try:
-                        emit_rover_data_now(reason='mode_change')
-                    except Exception as e:
-                        log_message(f"Failed to emit immediate update: {e}", "ERROR")
-                schedule_fast_emit()
-
-            elif msg_type == 'GLOBAL_POSITION_INT':
-                if msg.lat != 0 and msg.lon != 0:
-                    prev = current_state.position
-                    new_lat = msg.lat / 1e7
-                    new_lng = msg.lon / 1e7
-                    pos_changed = (
-                        prev is None or
-                        prev.lat != new_lat or
-                        prev.lng != new_lng
-                    )
-                    current_state.position = Position(lat=new_lat, lng=new_lng)
-                    if pos_changed:
-                        try:
-                            current_state.last_update = time.time()
-                        except Exception:
-                            pass
-                current_state.heading = (
-                    (msg.hdg / 100.0) if getattr(msg, 'hdg', 65535) != 65535 else 0
-                )
-                schedule_fast_emit()
-
-            elif msg_type == 'BATTERY_STATUS':
-                if msg.battery_remaining != -1:
-                    current_state.battery = msg.battery_remaining
-                    schedule_fast_emit()
-
-            elif msg_type == 'SYS_STATUS':
-                if msg.battery_remaining != -1:
-                    current_state.battery = msg.battery_remaining
-                    schedule_fast_emit()
-
-            elif msg_type == 'GPS_RAW_INT':
-                fix_types = {
-                    0: 'No GPS',
-                    1: 'No Fix',
-                    2: 'GPS 2D Fix',
-                    3: 'GPS 3D Fix',
-                    4: 'GPS DGPS',
-                    5: 'RTK Float',
-                    6: 'RTK Fixed'
-                }
-                current_state.rtk_status = fix_types.get(msg.fix_type, 'Unknown')
-                if hasattr(msg, 'eph') and hasattr(msg, 'epv'):
-                    current_state.hrms = (
-                        f"{msg.eph / 100.0:.3f}" if msg.eph != 65535 else '0.000'
-                    )
-                    current_state.vrms = (
-                        f"{msg.epv / 100.0:.3f}" if msg.epv != 65535 else '0.000'
-                    )
-                schedule_fast_emit()
-
-            elif msg_type == 'RC_CHANNELS':
-                current_state.rc_connected = msg.chan3_raw > 0
-                schedule_fast_emit()
-
-            elif msg_type == 'MISSION_CURRENT':
-                try:
-                    current_seq = int(getattr(msg, 'seq', -1))
-                except Exception:
-                    current_seq = -1
-
-                prev_seq = current_state.activeWaypointIndex
-                current_state.current_waypoint_id = current_seq
-                current_state.activeWaypointIndex = current_seq
-
-                mission_length = len(current_mission) if current_mission else 0
-
-                if current_seq <= 0:
-                    # Either mission just started or we wrapped back to the beginning.
-                    current_state.completedWaypointIds = []
-                    mission_log_state['last_active_seq'] = None
-                    mission_log_state['last_reached_seq'] = None
-                elif prev_seq is None:
-                    # We don't know prior progress; assume everything before the active item is completed.
-                    upper = current_seq if mission_length == 0 else min(current_seq, mission_length)
-                    current_state.completedWaypointIds = list(range(1, upper + 1))
-                    if upper > 0:
-                        mission_log_state['last_reached_seq'] = upper - 1
-                        for seq in range(upper):
-                            completed_id = seq + 1
-                            _record_mission_event(
-                                f"Waypoint {completed_id} completed",
-                                status='COMPLETED',
-                                waypoint_id=completed_id
-                            )
-                elif current_seq > prev_seq:
-                    # Advanced forward; mark everything between the previous and current index as completed.
-                    for seq in range(prev_seq, current_seq):
-                        completed_id = seq + 1
-                        if mission_length and completed_id > mission_length:
-                            break
-                        if completed_id not in current_state.completedWaypointIds:
-                            current_state.completedWaypointIds.append(completed_id)
-                            _record_mission_event(
-                                f"Waypoint {completed_id} completed",
-                                status='COMPLETED',
-                                waypoint_id=completed_id
-                            )
-                elif current_seq < prev_seq:
-                    # We moved backwards (skip/RTL). Drop completed IDs beyond the new active item.
-                    cutoff = current_seq
-                    current_state.completedWaypointIds = [
-                        wp_id for wp_id in current_state.completedWaypointIds
-                        if wp_id <= cutoff
-                    ]
-
-                if current_seq >= 0 and mission_log_state['last_active_seq'] != current_seq:
-                    mission_log_state['last_active_seq'] = current_seq
-                    _record_mission_event(
-                        f"Waypoint {current_seq + 1} active",
-                        status='ACTIVE',
-                        waypoint_id=current_seq + 1
-                    )
-
-                schedule_fast_emit()
-
-            elif msg_type == 'MISSION_ITEM_REACHED':
-                try:
-                    reached_seq = int(getattr(msg, 'seq', -1))
-                except Exception:
-                    reached_seq = -1
-                if reached_seq >= 0 and mission_log_state['last_reached_seq'] != reached_seq:
-                    mission_log_state['last_reached_seq'] = reached_seq
-                    _record_mission_event(
-                        f"Waypoint {reached_seq + 1} reached",
-                        status='REACHED',
-                        waypoint_id=reached_seq + 1
-                    )
-                schedule_fast_emit()
-
-            elif msg_type == 'AHRS2':
-                if hasattr(msg, 'roll') and hasattr(msg, 'pitch'):
-                    current_state.imu_status = (
-                        'ALIGNED' if abs(msg.roll) < 0.1 and abs(msg.pitch) < 0.1
-                        else 'ALIGNING'
-                    )
-                    schedule_fast_emit()
-
-            elif msg_type == 'COMMAND_ACK':
-                command_name = COMMAND_ID_TO_NAME.get(
-                    msg.command, f'COMMAND_{msg.command}'
-                )
-                result_status, result_message = COMMAND_RESULT_MAP.get(
-                    msg.result,
-                    ('info', f'Result code {msg.result}')
-                )
-                response = {
-                    'status': 'success' if result_status == 'success' else (
-                        'error' if result_status == 'error' else 'pending'
-                    ),
-                    'command': command_name,
-                    'message': result_message,
-                    'result': msg.result,
-                }
-                if command_name == 'DO_SET_SERVO':
-                    servo_state = 'SUCCESS' if response['status'] == 'success' else response['status'].upper()
-                    _record_mission_event(
-                        f"Servo command {result_message}",
-                        status='SERVO',
-                        servo_action=servo_state
-                    )
-                pending_match = next(
-                    (entry for entry in pending_command_queue
-                     if entry['command'] == command_name),
-                    None
-                )
-                try:
-                    _notify_ack_waiters(command_name, response)
-                except Exception:
-                    pass
-                if pending_match:
-                    if result_status == 'pending':
-                        socketio.emit('command_response', response,
-                                      room=pending_match.get('sid'))
-                        pending_match['timestamp'] = time.time()
-                    else:
-                        resolve_pending_command(command_name, response)
-                        try:
-                            socketio.sleep(0.05)
-                        except Exception:
-                            pass
-                        try:
-                            emit_rover_data_now(reason='command_ack')
-                        except Exception:
-                            pass
-                else:
-                    socketio.emit('vehicle_status_text', {
-                        'severity': 2 if response['status'] == 'success' else 4,
-                        'text': f"{command_name}: {result_message}",
-                    })
-
-            elif msg_type == 'STATUSTEXT':
-                text = (
-                    msg.text.decode('utf-8', errors='ignore')
-                    if isinstance(msg.text, bytes) else msg.text
-                )
-                severity = getattr(msg, 'severity', 6)
-                log_message(
-                    f"STATUSTEXT ({severity}): {text}",
-                    'INFO' if severity < 4 else 'ERROR'
-                )
-                socketio.emit('vehicle_status_text', {
-                    'severity': severity,
-                    'text': text,
+            mavros_connection_last_attempt = now
+            log_message(f"Attempting MAVROS connection to {bridge.host}:{bridge.port}")
+            bridge.connect(timeout=float(os.getenv("MAVROS_CONNECT_TIMEOUT", "10")))
+            log_message("MAVROS bridge connected to rosbridge", "SUCCESS")
+        except Exception as exc:
+            if is_vehicle_connected:
+                is_vehicle_connected = False
+                log_message("Vehicle connection lost via MAVROS", "ERROR")
+                socketio.emit('connection_status', {
+                    'status': 'WAITING_FOR_ROVER',
+                    'message': str(exc)
                 })
+            log_message(f"MAVROS connection error: {exc}", "ERROR")
+            socketio.sleep(2.0)
+        socketio.sleep(2.0)
 
-        except Exception as e:
-            log_message(f"Error processing message: {e}", "ERROR")
 
-        socketio.sleep(0.01)
+def _handle_mavros_telemetry(message: dict) -> None:
+    """Translate MAVROS telemetry payloads into the shared rover state."""
+    global is_vehicle_connected, current_mission
+    msg_type = str(message.get("type", "")).lower()
+
+    try:
+        if msg_type == "state":
+            connected = bool(message.get("connected", False))
+            armed = bool(message.get("armed", False))
+            mode = str(message.get("mode", "UNKNOWN")).upper()
+            previous = is_vehicle_connected
+            is_vehicle_connected = connected
+
+            with mavros_telem_lock:
+                current_state.status = "armed" if armed else "disarmed"
+                current_state.mode = mode
+                current_state.last_heartbeat = time.time() if connected else None
+                current_state.signal_strength = derive_signal_strength(
+                    current_state.last_heartbeat,
+                    current_state.rc_connected
+                )
+                current_state.last_update = time.time()
+
+            if connected and not previous:
+                log_message("Vehicle connected through MAVROS", "SUCCESS")
+                socketio.emit('connection_status', {'status': 'CONNECTED_TO_ROVER'})
+            elif not connected and previous:
+                log_message("Vehicle disconnected from MAVROS", "WARNING")
+                socketio.emit('connection_status', {'status': 'WAITING_FOR_ROVER'})
+
+            schedule_fast_emit()
+
+        elif msg_type == "navsat":
+            lat = message.get("latitude")
+            lon = message.get("longitude")
+            alt = message.get("altitude", 0.0)
+            if lat is not None and lon is not None:
+                with mavros_telem_lock:
+                    current_state.position = Position(lat=float(lat), lng=float(lon))
+                    current_state.last_update = time.time()
+                    current_state.distanceToNext = float(alt or 0.0)
+                schedule_fast_emit()
+
+        elif msg_type == "gps_fix":
+            status = message.get("status")
+            covariance = message.get("position_covariance", [])
+            with mavros_telem_lock:
+                current_state.rtk_status = _map_navsat_status(status)
+                if isinstance(covariance, list) and len(covariance) >= 3:
+                    try:
+                        hrms = math.sqrt(abs(float(covariance[0])))
+                        vrms = math.sqrt(abs(float(covariance[2])))
+                        current_state.hrms = f"{hrms:.3f}"
+                        current_state.vrms = f"{vrms:.3f}"
+                    except Exception:
+                        current_state.hrms = current_state.hrms or '0.000'
+                        current_state.vrms = current_state.vrms or '0.000'
+                current_state.last_update = time.time()
+            schedule_fast_emit()
+
+        elif msg_type == "heading":
+            heading = message.get("heading")
+            if heading is not None:
+                with mavros_telem_lock:
+                    current_state.heading = float(heading)
+                    current_state.last_update = time.time()
+            schedule_fast_emit()
+
+        elif msg_type == "battery":
+            percentage = message.get("percentage")
+            if percentage is not None:
+                with mavros_telem_lock:
+                    current_state.battery = max(0, int(round(float(percentage) * 100))) if percentage <= 1.0 else int(round(float(percentage)))
+                    current_state.last_update = time.time()
+            schedule_fast_emit()
+
+        elif msg_type == "mission_list":
+            waypoints = message.get("waypoints", [])
+            current_seq = message.get("current_seq")
+            converted = _convert_mavros_waypoints_to_ui(waypoints)
+            with mavros_telem_lock:
+                current_mission = converted
+                current_state.activeWaypointIndex = int(current_seq) if current_seq is not None else current_state.activeWaypointIndex
+                current_state.current_waypoint_id = current_state.activeWaypointIndex
+                current_state.last_update = time.time()
+            schedule_fast_emit()
+
+        elif msg_type == "mission_reached":
+            seq = message.get("wp_seq")
+            if seq is not None:
+                waypoint_id = int(seq) + 1
+                with mavros_telem_lock:
+                    if waypoint_id not in current_state.completedWaypointIds:
+                        current_state.completedWaypointIds.append(waypoint_id)
+                    current_state.current_waypoint_id = int(seq)
+                    current_state.activeWaypointIndex = int(seq)
+                    current_state.last_update = time.time()
+                _record_mission_event(
+                    f"Waypoint {waypoint_id} reached",
+                    status='REACHED',
+                    waypoint_id=waypoint_id
+                )
+                schedule_fast_emit()
+    except Exception as exc:
+        log_message(f"MAVROS telemetry handler error: {exc}", "ERROR")
+
 
 
 last_sent_telemetry = {}
@@ -942,70 +1096,116 @@ def telemetry_loop():
 
 def _handle_arm_disarm(data):
     """Handle arm/disarm command."""
-    if not master:
-        raise Exception("No connection to vehicle")
-    arm = data.get('arm', False)
+    arm = bool(data.get('arm', False))
+    global is_vehicle_connected
     log_message(f"{'Arming' if arm else 'Disarming'} vehicle...")
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0,
-        1 if arm else 0,
-        0, 0, 0, 0, 0, 0
-    )
-    try:
+
+    response_payload: dict[str, object] = {}
+    errors: list[str] = []
+    ros2_sent = False
+    mavros_sent = False
+
+    if command_bridge is not None:
+        try:
+            response = command_bridge.arm(value=arm)
+            ros2_sent = bool(response.get('success', False))
+            if not ros2_sent and response.get('result') is not None:
+                ros2_sent = bool(response['result'])
+            log_message(f"ROS2 arm service {'accepted' if ros2_sent else 'rejected'} ({response})")
+            response_payload['ros2'] = response
+        except Exception as exc:
+            log_message(f"ROS2 arm service failed: {exc}", "WARNING")
+            errors.append(f"ROS2: {exc}")
+
+    if not ros2_sent:
+        try:
+            bridge = _get_vehicle_bridge(require_vehicle=False)
+            mavros_response = bridge.arm(value=arm)
+            response_payload['mavros'] = mavros_response
+            log_message(f"MAVROS arm service acknowledged ({mavros_response})", 'INFO', event_type='ui_request')
+            mavros_sent = True
+            if not is_vehicle_connected:
+                # Assume vehicle is reachable if the command succeeded.
+                is_vehicle_connected = True
+        except Exception as exc:
+            errors.append(f"MAVROS: {exc}")
+            log_message(f"MAVROS arm/disarm failed: {exc}", "ERROR", event_type='ui_request')
+
+    if not ros2_sent and not mavros_sent:
+        error_text = "; ".join(errors) if errors else "unknown error"
+        raise RuntimeError(f"Arm/disarm command failed ({error_text})")
+
+    with mavros_telem_lock:
         current_state.status = 'armed' if arm else 'disarmed'
         current_state.last_update = time.time()
-        emit_rover_data_now(reason='arm_disarm')
-    except Exception:
-        pass
-    return f"Arm command {'sent' if arm else 'cancel sent'}"
+        current_state.last_heartbeat = time.time()
+    emit_rover_data_now(reason='arm_disarm')
+
+    record_activity(
+        f"Vehicle {'armed' if arm else 'disarmed'}",
+        event_type='server_response',
+        meta={
+            'via_ros2': ros2_sent,
+            'via_mavros': mavros_sent,
+            'response': _make_json_safe(response_payload),
+            'errors': errors,
+        }
+    )
+
+    return {
+        'status': 'success',
+        'via_ros2': ros2_sent,
+        'via_mavros': mavros_sent,
+        'message': f"Vehicle {'armed' if arm else 'disarmed'}"
+    }
 
 
 def _handle_set_mode(data):
     """Handle mode change command."""
-    if not master:
-        raise Exception("No connection to vehicle")
     new_mode = data.get('mode', 'MANUAL')
     mode_num = get_mode_number(new_mode)
     if mode_num is None:
         raise Exception(f"Unknown mode: {new_mode}")
     log_message(f"Setting vehicle mode to: {new_mode} (mode #{mode_num})")
-    master.mav.set_mode_send(
-        master.target_system,
-        mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        mode_num
-    )
-    try:
-        current_state.mode = new_mode.upper()
+
+    target_mode = str(new_mode).upper()
+    ros2_sent = False
+    if command_bridge is not None:
+        try:
+            response = command_bridge.set_mode(mode=target_mode)
+            ros2_sent = bool(response.get('success', False) and response.get('mode_sent', False))
+            log_message(f"ROS2 set_mode response: {response}")
+        except Exception as exc:
+            log_message(f"ROS2 set_mode failed: {exc}", "WARNING")
+
+    if not ros2_sent:
+        bridge = _require_vehicle_bridge()
+        bridge.set_mode(mode=target_mode, custom_mode=target_mode)
+
+    with mavros_telem_lock:
+        current_state.mode = target_mode
         current_state.last_update = time.time()
-        emit_rover_data_now(reason='set_mode')
-    except Exception:
-        pass
-    return f"Mode change requested: {new_mode}"
+    emit_rover_data_now(reason='set_mode')
+    return {
+        'status': 'success',
+        'via_ros2': ros2_sent,
+        'message': f"Mode change requested: {new_mode}"
+    }
 
 
 def _handle_goto(data):
     """Handle goto command."""
-    if not master:
-        raise Exception("No connection to vehicle")
+    bridge = _require_vehicle_bridge()
     lat = data['lat']
     lon = data['lon']
     alt = data.get('alt', 0)
     log_message(f"Sending vehicle to: {lat}, {lon}, alt: {alt}m")
-    master.mav.set_position_target_global_int_send(
-        0,
-        master.target_system,
-        master.target_component,
-        mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b0000111111111000,
-        int(lat * 1e7),
-        int(lon * 1e7),
-        alt,
-        0, 0, 0,
-        0, 0, 0,
-        0, 0
+    bridge.send_global_position_target(
+        latitude=float(lat),
+        longitude=float(lon),
+        altitude=float(alt),
+        coordinate_frame=mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        type_mask=0b0000111111111000
     )
     return {
         'status': 'success',
@@ -1016,131 +1216,38 @@ def _handle_goto(data):
 def _handle_upload_mission(data):
     """Upload a mission via Socket.IO to the Pixhawk."""
     global current_mission
-    if master is None:
-        raise RuntimeError("Vehicle not connected")
+    bridge = _require_vehicle_bridge()
     waypoints = data.get("waypoints")
     if not isinstance(waypoints, list) or not waypoints:
         raise ValueError("Mission upload requires waypoints")
     mission_count = len(waypoints)
     log_message(f"Mission upload initiated for {mission_count} waypoint(s)")
-
-    # Flush stale messages
-    flushed = 0
-    while True:
-        with mavlink_io_lock:
-            pending_msg = master.recv_match(blocking=False)
-        if pending_msg is None:
-            break
-        flushed += 1
-    if flushed:
-        log_message(f"Cleared {flushed} stale MAVLink messages", "DEBUG")
-
-    overall_deadline = time.time() + max(20.0, mission_count * 3.0)
-
-    def remaining_time() -> float:
-        return max(0.0, overall_deadline - time.time())
-
-    def wait_for_message(expected_types, description):
-        timeout = remaining_time()
-        if timeout <= 0:
-            raise TimeoutError(f"Timeout waiting for {description}")
-        with mavlink_io_lock:
-            msg = master.recv_match(type=expected_types, blocking=True, timeout=timeout)
-        if msg is None:
-            raise TimeoutError(f"Timeout waiting for {description}")
-        return msg
-
-    try:
-        log_message("Clearing existing mission on vehicle")
-        master.mav.mission_clear_all_send(master.target_system, master.target_component)
-        with mavlink_io_lock:
-            ack = master.recv_match(type="MISSION_ACK", blocking=True, timeout=2.0)
-        if ack is not None:
-            ack_type = getattr(ack, "type", None)
-            if ack_type != mavlink.MAV_MISSION_ACCEPTED:
-                raise RuntimeError(f"Mission clear rejected (code={ack_type})")
-            log_message("Vehicle acknowledged mission clear")
-
-        log_message(f"Sending mission count ({mission_count})")
-        master.mav.mission_count_send(master.target_system, master.target_component, mission_count)
-
-        for seq, waypoint in enumerate(waypoints):
-            request = wait_for_message(
-                ("MISSION_REQUEST", "MISSION_REQUEST_INT"),
-                f"MISSION_REQUEST for waypoint {seq}"
-            )
-            request_type = request.get_type()
-            requested_seq = getattr(request, "seq", None)
-            if requested_seq != seq:
-                raise RuntimeError(f"Vehicle requested {requested_seq}, expected {seq}")
-
-            command_id = resolve_mav_command(waypoint.get("command"))
-            frame = int(safe_float(
-                waypoint.get("frame", mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT),
-                mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-            ))
-            autocontinue = int(safe_float(waypoint.get("autocontinue", 1), 1))
-            params = [
-                safe_float(waypoint.get("param1", 0.0)),
-                safe_float(waypoint.get("param2", 0.0)),
-                safe_float(waypoint.get("param3", 0.0)),
-                safe_float(waypoint.get("param4", 0.0)),
-            ]
-
-            requires_nav = command_requires_nav_coordinates(command_id)
-
-            if requires_nav:
-                try:
-                    lat = float(waypoint["lat"])
-                    lon = float(waypoint["lng"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(f"Waypoint {seq} missing lat/lng") from exc
-                alt = float(waypoint.get("alt", 0.0))
-                float_x, float_y, float_z = lat, lon, alt
-                int_x, int_y = int(lat * 1e7), int(lon * 1e7)
-            else:
-                float_x = safe_float(waypoint.get("x", 0.0))
-                float_y = safe_float(waypoint.get("y", 0.0))
-                float_z = safe_float(waypoint.get("alt", waypoint.get("z", 0.0)))
-                int_x, int_y = int(float_x * 1e7), int(float_y * 1e7)
-
-            if request_type == "MISSION_REQUEST_INT":
-                master.mav.mission_item_int_send(
-                    master.target_system, master.target_component,
-                    seq, frame, command_id, 0, autocontinue,
-                    *params, int_x, int_y, float_z
-                )
-            else:
-                master.mav.mission_item_send(
-                    master.target_system, master.target_component,
-                    seq, frame, command_id, 0, autocontinue,
-                    *params, float_x, float_y, float_z
-                )
-
-        ack = wait_for_message("MISSION_ACK", "MISSION_ACK")
-        ack_result = getattr(ack, "type", None)
-        if ack_result != mavlink.MAV_MISSION_ACCEPTED:
-            raise RuntimeError(f"Mission rejected (code={ack_result})")
-
-        current_mission = list(waypoints)
-        log_message(f"Mission uploaded successfully ({mission_count} waypoints)", "SUCCESS")
-        return {
-            "status": "success",
-            "message": f"Mission uploaded ({mission_count} waypoints)"
-        }
-    except TimeoutError as exc:
-        log_message(f"Mission upload timeout: {exc}", "ERROR")
-        raise
-    except Exception as exc:
-        log_message(f"Mission upload failed: {exc}", "ERROR")
-        raise
+    mavros_waypoints = _build_mavros_waypoints(waypoints)
+    response = bridge.push_waypoints(mavros_waypoints)
+    if not response.get("success", False):
+        raise RuntimeError(f"MAVROS mission push failed: {response}")
+    current_mission = list(waypoints)
+    with mavros_telem_lock:
+        current_state.completedWaypointIds = []
+        current_state.activeWaypointIndex = None
+        current_state.current_waypoint_id = None
+        mission_log_state['last_active_seq'] = None
+        mission_log_state['last_reached_seq'] = None
+    _record_mission_event(
+        f"Mission uploaded ({mission_count} items)",
+        status='MISSION_UPLOADED'
+    )
+    log_message(f"Mission uploaded successfully via MAVROS ({mission_count} waypoints)", "SUCCESS")
+    return {
+        "status": "success",
+        "message": f"Mission uploaded ({mission_count} waypoints)"
+    }
 
 
 def _handle_get_mission(data):
     """Handle GET_MISSION command."""
     global current_mission
-    if not master:
-        raise Exception("No connection to vehicle")
+    _require_vehicle_bridge()
     try:
         mission_waypoints = download_mission_from_vehicle()
         return {
@@ -1157,12 +1264,33 @@ def _handle_get_mission(data):
         }
 
 
+def _handle_clear_mission(_data=None):
+    """Clear all mission waypoints from the vehicle."""
+    global current_mission
+    bridge = _require_vehicle_bridge()
+    log_message("Clearing mission from vehicle...")
+    response = bridge.clear_waypoints()
+    if not response.get('success', False):
+        raise RuntimeError(f"MAVROS mission clear failed: {response}")
+    with mavros_telem_lock:
+        current_mission = []
+        current_state.completedWaypointIds = []
+        current_state.activeWaypointIndex = None
+        current_state.current_waypoint_id = None
+        current_state.last_update = time.time()
+    _record_mission_event('Mission cleared from vehicle', status='MISSION_CLEARED')
+    emit_rover_data_now(reason='mission_clear')
+    log_message("Mission cleared successfully via MAVROS", "SUCCESS")
+    return {'status': 'success', 'message': 'Mission cleared'}
+
+
 COMMAND_HANDLERS = {
     'ARM_DISARM': _handle_arm_disarm,
     'SET_MODE': _handle_set_mode,
     'GOTO': _handle_goto,
     'UPLOAD_MISSION': _handle_upload_mission,
-    'GET_MISSION': _handle_get_mission
+    'GET_MISSION': _handle_get_mission,
+    'CLEAR_MISSION': _handle_clear_mission,
 }
 
 
@@ -1182,298 +1310,81 @@ def handle_request_mission_logs():
 @socketio.on("mission_upload")
 def on_mission_upload(data):
     """Mission upload via Socket.IO with progress updates."""
-    global master, current_mission
+    global current_mission
 
     try:
-        if master is None:
-            emit("mission_uploaded", {"ok": False, "error": "Vehicle not connected"})
-            return
+        bridge = _require_vehicle_bridge()
+    except Exception as exc:
+        emit("mission_uploaded", {"ok": False, "error": str(exc)})
+        return
 
-        waypoints = data.get("waypoints", [])
-        servo_config = data.get("servoConfig")
+    waypoints = data.get("waypoints", [])
+    servo_config = data.get("servoConfig")
 
-        if not waypoints:
-            emit("mission_uploaded", {"ok": False, "error": "No waypoints provided"})
-            return
+    if not waypoints:
+        emit("mission_uploaded", {"ok": False, "error": "No waypoints provided"})
+        return
 
-        if servo_config:
-            log_message(f"[mission_upload] Applying servo mode: {servo_config.get('mode')}")
-            waypoints = apply_servo_modes(waypoints, servo_config)
+    if servo_config:
+        log_message(f"[mission_upload] Applying servo mode: {servo_config.get('mode')}")
+        waypoints = apply_servo_modes(waypoints, servo_config)
 
-        mission_count = len(waypoints)
-        log_message(f"[mission_upload] Uploading {mission_count} waypoints")
+    mission_count = len(waypoints)
+    log_message(f"[mission_upload] Uploading {mission_count} waypoints via MAVROS")
 
-        if not mission_upload_lock.acquire(blocking=False):
-            emit("mission_uploaded", {"ok": False, "error": "Upload in progress"})
-            return
+    if not mission_upload_lock.acquire(blocking=False):
+        emit("mission_uploaded", {"ok": False, "error": "Upload in progress"})
+        return
 
-        try:
-            # Flush stale messages
-            flushed = 0
-            while True:
-                with mavlink_io_lock:
-                    pending = master.recv_match(blocking=False)
-                if pending is None:
-                    break
-                flushed += 1
-            if flushed:
-                log_message(f"[mission_upload] Flushed {flushed} messages", "DEBUG")
+    try:
+        socketio.emit('mission_upload_progress', {'progress': 5})
+        mavros_waypoints = _build_mavros_waypoints(waypoints)
+        response = bridge.push_waypoints(mavros_waypoints)
+        if not response.get("success", False):
+            raise RuntimeError(f"MAVROS mission push failed: {response}")
 
-            # Clear old mission
-            master.mav.mission_clear_all_send(master.target_system, master.target_component)
-            with mavlink_io_lock:
-                ack = master.recv_match(type="MISSION_ACK", blocking=True, timeout=2.0)
-            if ack is not None:
-                log_message(f"[mission_upload] Clear ACK: {getattr(ack, 'type', None)}", "DEBUG")
-
-            def send_count():
-                master.mav.mission_count_send(master.target_system, master.target_component, mission_count)
-                socketio.emit('mission_upload_progress', {'progress': 0})
-
-            send_count()
-            uploaded_set: set[int] = set()
-            deadline = time.time() + max(20.0, mission_count * 3.0)
-            last_activity = time.time()
-
-            while True:
-                remaining = max(0.0, deadline - time.time())
-                if remaining <= 0:
-                    raise RuntimeError("Timeout waiting for mission request/ack")
-
-                if time.time() - last_activity > 2.5:
-                    log_message("[mission_upload] Re-sending count", "WARNING")
-                    send_count()
-                    last_activity = time.time()
-
-                with mavlink_io_lock:
-                    msg = master.recv_match(
-                        type=["MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK"],
-                        blocking=True,
-                        timeout=min(2.5, remaining)
-                    )
-                if not msg:
-                    continue
-
-                last_activity = time.time()
-                mtype = msg.get_type()
-
-                if mtype in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
-                    seq = int(getattr(msg, "seq", 0))
-                    if seq < 0 or seq >= mission_count:
-                        raise RuntimeError(f"Invalid seq {seq}")
-
-                    wp = waypoints[seq]
-                    cmd_id = resolve_mav_command(wp.get("command"))
-                    frame = int(safe_float(
-                        wp.get("frame", mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT),
-                        mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-                    ))
-                    p1 = safe_float(wp.get("param1", 0.0))
-                    p2 = safe_float(wp.get("param2", 0.0))
-                    p3 = safe_float(wp.get("param3", 0.0))
-                    p4 = safe_float(wp.get("param4", 0.0))
-
-                    if command_requires_nav_coordinates(cmd_id):
-                        lat = safe_float(wp.get("lat", 0.0))
-                        lon = safe_float(wp.get("lng", wp.get("lon", 0.0)))
-                        alt = safe_float(wp.get("alt", 0.0))
-                        if mtype == "MISSION_REQUEST_INT":
-                            master.mav.mission_item_int_send(
-                                master.target_system, master.target_component,
-                                seq, frame, cmd_id, 0, 1,
-                                p1, p2, p3, p4,
-                                int(lat * 1e7), int(lon * 1e7), alt
-                            )
-                        else:
-                            master.mav.mission_item_send(
-                                master.target_system, master.target_component,
-                                seq, frame, cmd_id, 0, 1,
-                                p1, p2, p3, p4,
-                                lat, lon, alt
-                            )
-                    else:
-                        alt = safe_float(wp.get("alt", wp.get("z", 0.0)))
-                        if mtype == "MISSION_REQUEST_INT":
-                            master.mav.mission_item_int_send(
-                                master.target_system, master.target_component,
-                                seq, frame, cmd_id, 0, 1,
-                                p1, p2, p3, p4,
-                                0, 0, alt
-                            )
-                        else:
-                            master.mav.mission_item_send(
-                                master.target_system, master.target_component,
-                                seq, frame, cmd_id, 0, 1,
-                                p1, p2, p3, p4,
-                                0.0, 0.0, alt
-                            )
-
-                    if seq not in uploaded_set:
-                        uploaded_set.add(seq)
-                        progress = int(round(100.0 * len(uploaded_set) / mission_count))
-                        socketio.emit('mission_upload_progress', {'progress': progress})
-
-                elif mtype == "MISSION_ACK":
-                    ack_type = getattr(msg, "type", None)
-                    log_message(f"[mission_upload] ACK received (code={ack_type})")
-                    if ack_type != mavlink.MAV_MISSION_ACCEPTED:
-                        emit("mission_uploaded", {
-                            "ok": False,
-                            "error": f"ACK code {ack_type}",
-                            "count": len(uploaded_set)
-                        })
-                        return
-
-                    current_mission = list(waypoints)
-                    current_state.completedWaypointIds = []
-                    current_state.activeWaypointIndex = None
-                    current_state.current_waypoint_id = None
-                    mission_log_state['last_active_seq'] = None
-                    mission_log_state['last_reached_seq'] = None
-                    _record_mission_event(
-                        f"Mission uploaded ({mission_count} items)",
-                        status='MISSION_UPLOADED'
-                    )
-                    socketio.emit('mission_upload_progress', {'progress': 100})
-                    emit("mission_uploaded", {"ok": True, "count": len(uploaded_set)})
-                    return
-        finally:
-            try:
-                mission_upload_lock.release()
-            except Exception:
-                pass
-
+        current_mission = list(waypoints)
+        with mavros_telem_lock:
+            current_state.completedWaypointIds = []
+            current_state.activeWaypointIndex = None
+            current_state.current_waypoint_id = None
+            mission_log_state['last_active_seq'] = None
+            mission_log_state['last_reached_seq'] = None
+        _record_mission_event(
+            f"Mission uploaded ({mission_count} items)",
+            status='MISSION_UPLOADED'
+        )
+        socketio.emit('mission_upload_progress', {'progress': 100})
+        emit("mission_uploaded", {"ok": True, "count": mission_count})
     except Exception as e:
         log_message(f"[mission_upload] Error: {e}", "ERROR")
         emit("mission_uploaded", {"ok": False, "error": str(e)})
+    finally:
+        try:
+            mission_upload_lock.release()
+        except Exception:
+            pass
 
 
 def download_mission_from_vehicle():
     """Download mission from vehicle."""
     global current_mission
-    if not master:
-        raise Exception("No connection to vehicle")
+    bridge = _require_vehicle_bridge()
     if not mission_download_lock.acquire(blocking=False):
         raise Exception("Another download in progress")
 
     try:
-        # Flush stale messages
-        flushed = 0
-        while True:
-            with mavlink_io_lock:
-                pending = master.recv_match(blocking=False)
-            if pending is None:
-                break
-            flushed += 1
-        if flushed:
-            log_message(f"[mission_download] Flushed {flushed} messages", "DEBUG")
-
-        log_message("[mission_download] Requesting mission list...")
-        master.mav.mission_request_list_send(master.target_system, master.target_component)
-
-        with mavlink_io_lock:
-            msg = master.recv_match(type='MISSION_COUNT', blocking=True, timeout=8.0)
-        if not msg:
-            master.mav.mission_request_list_send(master.target_system, master.target_component)
-            with mavlink_io_lock:
-                msg = master.recv_match(type='MISSION_COUNT', blocking=True, timeout=8.0)
-        if not msg:
-            raise Exception("Failed to receive mission count")
-
-        mission_count = int(getattr(msg, 'count', 0))
-        log_message(f"[mission_download] Vehicle reports {mission_count} waypoints")
-
-        if mission_count <= 0:
-            current_mission = []
-            socketio.emit('mission_download_progress', {'progress': 100})
-            return []
-
-        downloaded: list[dict] = [None] * mission_count  # type: ignore
-        received_set: set[int] = set()
-        deadline = time.time() + max(20.0, mission_count * 3.0)
-
-        def emit_progress():
-            try:
-                pct = int(round(100.0 * len(received_set) / mission_count))
-                socketio.emit('mission_download_progress', {'progress': pct})
-            except Exception:
-                pass
-
-        def request_seq(seq: int, prefer_int: bool = True) -> None:
-            if prefer_int:
-                master.mav.mission_request_int_send(
-                    master.target_system, master.target_component, seq
-                )
-            else:
-                master.mav.mission_request_send(
-                    master.target_system, master.target_component, seq
-                )
-
-        prefer_int = True
-        retries_per_item = 3
-
-        for seq in range(mission_count):
-            attempt = 0
-            while attempt < retries_per_item and seq not in received_set:
-                attempt += 1
-                request_seq(seq, prefer_int=prefer_int)
-                with mavlink_io_lock:
-                    msg = master.recv_match(
-                        type=['MISSION_ITEM_INT', 'MISSION_ITEM'],
-                        blocking=True,
-                        timeout=3.0
-                    )
-                if not msg:
-                    if attempt == 2 and prefer_int:
-                        prefer_int = False
-                    continue
-
-                mtype = msg.get_type()
-                if mtype not in ('MISSION_ITEM_INT', 'MISSION_ITEM'):
-                    continue
-
-                msg_seq = int(getattr(msg, 'seq', -1))
-                if msg_seq != seq:
-                    continue
-
-                if mtype == 'MISSION_ITEM_INT':
-                    lat = getattr(msg, 'x', 0) / 1e7
-                    lon = getattr(msg, 'y', 0) / 1e7
-                else:
-                    lat = getattr(msg, 'x', 0.0)
-                    lon = getattr(msg, 'y', 0.0)
-
-                cmd = int(getattr(msg, 'command', 0))
-                waypoint = {
-                    'id': msg_seq + 1,
-                    'command': 'WAYPOINT' if cmd == mavlink.MAV_CMD_NAV_WAYPOINT else 'DO_SET_SERVO',
-                    'lat': lat,
-                    'lng': lon,
-                    'alt': float(getattr(msg, 'z', 0.0)),
-                    'frame': int(getattr(msg, 'frame', mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT)),
-                    'param1': float(getattr(msg, 'param1', 0.0)),
-                    'param2': float(getattr(msg, 'param2', 0.0)),
-                    'param3': float(getattr(msg, 'param3', 0.0)),
-                    'param4': float(getattr(msg, 'param4', 0.0)),
-                }
-                downloaded[msg_seq] = waypoint
-                received_set.add(msg_seq)
-                log_message(f"[mission_download] Received {msg_seq+1}/{mission_count}")
-                emit_progress()
-                deadline = time.time() + max(10.0, (mission_count - msg_seq) * 2.0)
-
-            if seq not in received_set:
-                raise Exception(f"Timeout receiving item {seq}")
-
-        result = [wp for wp in downloaded if wp is not None]
-        current_mission = result.copy()
+        socketio.emit('mission_download_progress', {'progress': 5})
+        response = bridge.pull_waypoints()
+        waypoint_list = response.get("waypoints", [])
+        converted = _convert_mavros_waypoints_to_ui(waypoint_list)
+        current_mission = converted.copy()
         socketio.emit('mission_download_progress', {'progress': 100})
-        log_message(f"[mission_download] Completed: {len(result)} waypoints", "SUCCESS")
-        return result
-
+        log_message(f"[mission_download] Completed via MAVROS: {len(converted)} waypoints", "SUCCESS")
+        return converted
     except Exception as e:
         log_message(f"Error downloading mission: {e}", "ERROR")
-        raise e
+        raise
     finally:
         try:
             mission_download_lock.release()
@@ -1508,8 +1419,10 @@ def _ntrip_request(host: str, mount: str, user: str, pwd: str) -> bytes:
 
 def _inject_rtcm_to_mav(rtcm_bytes: bytes) -> bool:
     """Send RTCM correction data to rover's GPS module."""
-    if not master:
-        log_message("[RTK] ⚠️ Cannot send - rover not connected!", "WARNING")
+    try:
+        bridge = _require_vehicle_bridge()
+    except Exception as exc:
+        log_message(f"[RTK] ⚠️ Cannot send - {exc}", "WARNING")
         return False
 
     MAX_CHUNK = 180
@@ -1518,10 +1431,7 @@ def _inject_rtcm_to_mav(rtcm_bytes: bytes) -> bool:
         for i in range(0, len(rtcm_bytes), MAX_CHUNK):
             chunk = rtcm_bytes[i:i + MAX_CHUNK]
             if chunk:
-                # Create a 180-byte buffer and place the chunk at the start.
-                data_payload = bytearray(180)
-                data_payload[:len(chunk)] = chunk
-                master.mav.gps_rtcm_data_send(0, len(chunk), data_payload)
+                bridge.send_rtcm(bytes(chunk))
                 total_sent += len(chunk)
 
         if total_sent > 0:
@@ -1582,9 +1492,11 @@ def handle_connect_caster(caster_details):
         }, to=sender_id)
         return
 
-    # --- FIX: Check if rover is connected before starting RTK ---
-    if not is_vehicle_connected or not master:
-        msg = '❌ Rover not connected! Connect rover first.'
+    # Ensure the bridge and vehicle are connected before starting RTK
+    try:
+        _require_vehicle_bridge()
+    except Exception as exc:
+        msg = f'❌ {exc}'
         log_message(f"[RTK] Rejecting stream start: {msg}", "WARNING")
         socketio.emit('rtk_log', {'message': msg})
         socketio.emit('caster_status', {
@@ -1592,9 +1504,6 @@ def handle_connect_caster(caster_details):
             'message': msg
         }, to=sender_id)
         return
-    # --- END FIX ---
-
-    
 
     rtk_current_caster = caster_details
     log_message(f"[RTK] 🚀 Starting stream from {host}:{port}/{mount}", "INFO")
@@ -1834,18 +1743,16 @@ def handle_disconnect():
 @socketio.on('request_rover_reconnect')
 def handle_rover_reconnect():
     """Force the backend to drop and re-establish the vehicle link."""
-    global master, is_vehicle_connected
+    global is_vehicle_connected
 
     log_message('Frontend requested rover reconnect', 'INFO')
     emit('rover_reconnect_ack', {'status': 'success', 'message': 'Reconnect initiated'})
 
-    with mavlink_io_lock:
-        if master is not None:
-            try:
-                master.close()
-            except Exception as exc:
-                log_message(f'Error closing MAVLink connection: {exc}', 'WARNING')
-        master = None
+    try:
+        bridge = _init_mavros_bridge()
+        bridge.close()
+    except Exception as exc:
+        log_message(f'Error closing MAVROS bridge: {exc}', 'WARNING')
 
     is_vehicle_connected = False
     current_state.last_heartbeat = None
@@ -1860,61 +1767,684 @@ def handle_rover_reconnect():
 @socketio.on('send_command')
 def handle_command(data):
     """Handle incoming commands from the frontend."""
-    if not is_vehicle_connected or not master:
-        log_message("Command rejected - vehicle not connected", "ERROR")
-        emit('command_response', {'status': 'error', 'message': 'Vehicle not connected'})
+    try:
+        _require_vehicle_bridge()
+    except Exception as exc:
+        log_message("Command rejected - vehicle not connected", "ERROR", event_type='ui_request')
+        payload = {'status': 'error', 'message': str(exc)}
+        emit('command_response', payload)
+        record_activity(
+            "Socket command rejected - vehicle not connected",
+            level='ERROR',
+            event_type='server_response',
+            meta={'reason': str(exc)}
+        )
         return
 
     command_type = data.get('command')
-    log_message(f"Received command: {command_type}")
+    log_message(f"Received command: {command_type}", event_type='ui_request')
+    record_activity(
+        f"Socket command received: {command_type}",
+        event_type='ui_request',
+        meta={
+            'command': command_type,
+            'payload_keys': sorted(list(data.keys()))[:10] if isinstance(data, dict) else None
+        }
+    )
+
+    handler = COMMAND_HANDLERS.get(command_type)
+    if not handler:
+        log_message(f"Unknown command: {command_type}", "ERROR", event_type='ui_request')
+        payload = {
+            'status': 'error',
+            'message': f'Unknown command: {command_type}'
+        }
+        emit('command_response', payload)
+        record_activity(
+            f"Unknown command received: {command_type}",
+            level='ERROR',
+            event_type='server_response',
+            meta={'command': command_type}
+        )
+        return
 
     try:
-        handler = COMMAND_HANDLERS.get(command_type)
-        if handler:
-            wait_for_ack_flag = bool(data.get('wait_for_ack')) and command_type in ('ARM_DISARM', 'SET_MODE')
-            ack_timeout = float(data.get('ack_timeout', 20)) if wait_for_ack_flag else None
-
-            if command_type in ('ARM_DISARM', 'SET_MODE') and not wait_for_ack_flag:
-                queue_pending_command(command_type, request.sid, f"{command_type} dispatched")
-
-            result = handler(data)
-
-            if wait_for_ack_flag:
-                try:
-                    final = wait_for_ack(command_type, timeout=ack_timeout or 20.0)
-                except Exception as e:
-                    final = {'status': 'error', 'message': str(e), 'command': command_type}
-                emit('command_response', final)
-                return
-
-            if isinstance(result, dict):
-                emit('command_response', result)
-            elif isinstance(result, str):
-                log_message(result, 'INFO')
-            else:
-                log_message(f"Command {command_type} executed", 'INFO')
+        result = handler(data)
+        if isinstance(result, dict):
+            emit('command_response', result)
+            record_activity(
+                f"Socket command '{command_type}' processed",
+                event_type='server_response',
+                meta={'command': command_type, 'response': _make_json_safe(result)}
+            )
+        elif isinstance(result, str):
+            emit('command_response', {'status': 'success', 'message': result})
+            record_activity(
+                f"Socket command '{command_type}' processed",
+                event_type='server_response',
+                meta={'command': command_type, 'message': result}
+            )
         else:
-            log_message(f"Unknown command: {command_type}", "ERROR")
-            emit('command_response', {
-                'status': 'error',
-                'message': f'Unknown command: {command_type}'
-            })
+            payload = {'status': 'success', 'message': f"{command_type} dispatched"}
+            emit('command_response', payload)
+            record_activity(
+                f"Socket command '{command_type}' processed",
+                event_type='server_response',
+                meta={'command': command_type, 'message': payload['message']}
+            )
     except Exception as e:
-        log_message(f"Command error ({command_type}): {e}", "ERROR")
-        if command_type in ('ARM_DISARM', 'SET_MODE'):
-            resolve_pending_command(command_type, {
-                'status': 'error',
-                'message': f'Command failed: {str(e)}'
-            })
-        emit('command_response', {
+        log_message(f"Command error ({command_type}): {e}", "ERROR", event_type='server_response')
+        payload = {
             'status': 'error',
-            'message': f'Command failed: {str(e)}'
-        })
+            'message': str(e),
+            'command': command_type
+        }
+        emit('command_response', payload)
+        record_activity(
+            f"Socket command '{command_type}' failed",
+            level='ERROR',
+            event_type='server_response',
+            meta=_make_json_safe(payload)
+        )
+
+
+# ============================================================================
+# ACTIVITY MONITOR PAGE
+# ============================================================================
+
+MONITOR_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NRP Backend Activity Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    margin: 0;
+    background-color: #0f172a;
+    color: #e2e8f0;
+}
+header {
+    background: #111827;
+    padding: 1rem 1.5rem;
+    font-size: 1.4rem;
+    font-weight: bold;
+    border-bottom: 1px solid #1f2937;
+}
+.page {
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    align-items: center;
+    background: #111827;
+    padding: 1rem;
+    border: 1px solid #1f2937;
+    border-radius: 0.5rem;
+}
+.toolbar label {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.85rem;
+    color: #94a3b8;
+    gap: 0.3rem;
+}
+.toolbar select,
+.toolbar input {
+    background: #0f172a;
+    border: 1px solid #1f2937;
+    color: #e2e8f0;
+    padding: 0.4rem 0.6rem;
+    border-radius: 0.35rem;
+}
+.toolbar button {
+    background: #2563eb;
+    color: #e2e8f0;
+    border: none;
+    border-radius: 0.35rem;
+    padding: 0.45rem 0.8rem;
+    cursor: pointer;
+    font-weight: 600;
+}
+.toolbar button:hover {
+    background: #1d4ed8;
+}
+.status-strip {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    font-size: 0.9rem;
+    color: #94a3b8;
+}
+.status-strip span {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+.status-pill {
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.status-pill.ok {
+    background: #047857;
+    color: #d1fae5;
+}
+.status-pill.warn {
+    background: #b91c1c;
+    color: #fee2e2;
+}
+.log-container {
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 0.5rem;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.log-scroll {
+    overflow-y: auto;
+    max-height: 65vh;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+thead {
+    background: #1f2937;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+th, td {
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid #1f2937;
+    text-align: left;
+    vertical-align: top;
+}
+tbody tr:nth-child(even) {
+    background: rgba(15, 23, 42, 0.6);
+}
+tr.level-error {
+    background: rgba(220, 38, 38, 0.15);
+}
+tr.level-warning {
+    background: rgba(234, 179, 8, 0.18);
+}
+code {
+    font-family: Consolas, Menlo, Monaco, monospace;
+    font-size: 0.8rem;
+}
+.message {
+    white-space: pre-wrap;
+}
+@media (max-width: 720px) {
+    header {
+        font-size: 1.1rem;
+    }
+    th, td {
+        font-size: 0.75rem;
+    }
+    .toolbar {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    .toolbar label {
+        width: 100%;
+    }
+    .status-strip {
+        flex-direction: column;
+    }
+}
+</style>
+</head>
+<body>
+<header>NRP Backend Activity Monitor</header>
+<div class="page">
+    <div class="toolbar">
+        <label>
+            Event type
+            <select id="event-filter">
+                <option value="">All events</option>
+            </select>
+        </label>
+        <label>
+            Text filter
+            <input type="text" id="text-filter" placeholder="Search message or meta">
+        </label>
+        <label>
+            <span>Display options</span>
+            <span>
+                <input type="checkbox" id="auto-scroll" checked> Auto-scroll
+            </span>
+        </label>
+        <button id="refresh-button" type="button">Refresh</button>
+        <button id="download-button" type="button">Download</button>
+    </div>
+    <div class="status-strip">
+        <span>Socket:
+            <span id="socket-status" class="status-pill warn">Connecting</span>
+        </span>
+        <span>Showing <span id="result-count">0</span> entries</span>
+        <span>Last update <span id="last-updated">-</span></span>
+    </div>
+    <div class="log-container">
+        <div class="log-scroll" id="log-scroll">
+            <table id="activity-table">
+                <thead>
+                    <tr>
+                        <th>Time (UTC)</th>
+                        <th>Level</th>
+                        <th>Event</th>
+                        <th>Message</th>
+                        <th>Meta</th>
+                    </tr>
+                </thead>
+                <tbody id="activity-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+(function () {
+    const API_LIMIT = 1000;
+    const entries = [];
+    const tableBody = document.getElementById('activity-body');
+    const filterSelect = document.getElementById('event-filter');
+    const searchInput = document.getElementById('text-filter');
+    const autoScroll = document.getElementById('auto-scroll');
+    const statusEl = document.getElementById('socket-status');
+    const countEl = document.getElementById('result-count');
+    const lastUpdatedEl = document.getElementById('last-updated');
+    const logScroll = document.getElementById('log-scroll');
+    const refreshButton = document.getElementById('refresh-button');
+    const downloadButton = document.getElementById('download-button');
+    const knownEvents = new Set();
+    let renderQueued = false;
+
+    function classForLevel(level) {
+        if (!level) {
+            return '';
+        }
+        const lower = String(level).toLowerCase();
+        if (lower === 'error') {
+            return 'level-error';
+        }
+        if (lower === 'warning' || lower === 'warn') {
+            return 'level-warning';
+        }
+        return '';
+    }
+
+    function formatMeta(meta) {
+        if (meta === null || meta === undefined) {
+            return '';
+        }
+        if (typeof meta === 'string' || typeof meta === 'number' || typeof meta === 'boolean') {
+            return String(meta);
+        }
+        try {
+            return JSON.stringify(meta);
+        } catch (err) {
+            return String(meta);
+        }
+    }
+
+    function matchesFilter(entry) {
+        const selected = filterSelect.value;
+        if (selected && entry.event !== selected) {
+            return false;
+        }
+        const search = searchInput.value.trim().toLowerCase();
+        if (!search) {
+            return true;
+        }
+        const text = [
+            entry.message || '',
+            entry.level || '',
+            entry.event || '',
+            formatMeta(entry.meta)
+        ].join(' ').toLowerCase();
+        return text.indexOf(search) !== -1;
+    }
+
+    function updateFilterOptions() {
+        let changed = false;
+        entries.forEach((entry) => {
+            if (entry.event && !knownEvents.has(entry.event)) {
+                knownEvents.add(entry.event);
+                changed = true;
+            }
+        });
+        if (!changed) {
+            return;
+        }
+        const current = filterSelect.value;
+        const options = [''];
+        knownEvents.forEach((event) => options.push(event));
+        options.sort((a, b) => a.localeCompare(b));
+        filterSelect.innerHTML = '';
+        options.forEach((value) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value ? value : 'All events';
+            filterSelect.appendChild(option);
+        });
+        filterSelect.value = current;
+    }
+
+    function render() {
+        const filtered = entries.filter(matchesFilter);
+        tableBody.innerHTML = '';
+        filtered.forEach((entry) => {
+            const tr = document.createElement('tr');
+            tr.className = classForLevel(entry.level);
+
+            const tsCell = document.createElement('td');
+            tsCell.textContent = entry.isoTime || '';
+            tr.appendChild(tsCell);
+
+            const levelCell = document.createElement('td');
+            levelCell.textContent = entry.level || '';
+            tr.appendChild(levelCell);
+
+            const eventCell = document.createElement('td');
+            eventCell.textContent = entry.event || '';
+            tr.appendChild(eventCell);
+
+            const messageCell = document.createElement('td');
+            messageCell.className = 'message';
+            messageCell.textContent = entry.message || '';
+            tr.appendChild(messageCell);
+
+            const metaCell = document.createElement('td');
+            metaCell.innerHTML = '<code></code>';
+            const code = metaCell.querySelector('code');
+            code.textContent = formatMeta(entry.meta);
+            tr.appendChild(metaCell);
+
+            tableBody.appendChild(tr);
+        });
+        countEl.textContent = filtered.length;
+        if (filtered.length > 0) {
+            lastUpdatedEl.textContent = filtered[filtered.length - 1].isoTime || '-';
+        }
+        if (autoScroll.checked) {
+            logScroll.scrollTop = logScroll.scrollHeight;
+        }
+    }
+
+    function scheduleRender() {
+        if (renderQueued) {
+            return;
+        }
+        renderQueued = true;
+        window.requestAnimationFrame(() => {
+            renderQueued = false;
+            render();
+        });
+    }
+
+    async function loadInitial() {
+        try {
+            const response = await fetch('/api/activity?limit=' + API_LIMIT);
+            const data = await response.json();
+            entries.length = 0;
+            if (Array.isArray(data.entries)) {
+                data.entries.forEach((entry) => entries.push(entry));
+            }
+            updateFilterOptions();
+            scheduleRender();
+        } catch (err) {
+            console.error('Failed to fetch activity', err);
+        }
+    }
+
+    async function refreshTypes() {
+        try {
+            const response = await fetch('/api/activity/types');
+            const data = await response.json();
+            if (Array.isArray(data.events)) {
+                data.events.forEach((event) => knownEvents.add(event));
+                updateFilterOptions();
+            }
+        } catch (err) {
+            console.error('Failed to fetch activity types', err);
+        }
+    }
+
+    filterSelect.addEventListener('change', scheduleRender);
+    searchInput.addEventListener('input', scheduleRender);
+    autoScroll.addEventListener('change', scheduleRender);
+
+    refreshButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        loadInitial();
+    });
+
+    downloadButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        window.open('/api/activity/download', '_blank');
+    });
+
+    const socket = io();
+    socket.on('connect', () => {
+        statusEl.textContent = 'Connected';
+        statusEl.className = 'status-pill ok';
+    });
+    socket.on('disconnect', () => {
+        statusEl.textContent = 'Disconnected';
+        statusEl.className = 'status-pill warn';
+    });
+    socket.on('server_activity', (entry) => {
+        entries.push(entry);
+        if (entries.length > API_LIMIT * 5) {
+            entries.splice(0, entries.length - API_LIMIT * 5);
+        }
+        if (entry && entry.event) {
+            knownEvents.add(entry.event);
+            updateFilterOptions();
+        }
+        scheduleRender();
+    });
+
+    loadInitial();
+    refreshTypes();
+})();</script>
+</body>
+</html>
+"""
+
+
+@app.get("/monitor")
+def monitor_dashboard():
+    return Response(MONITOR_PAGE_HTML, mimetype='text/html')
 
 
 # ============================================================================
 # ERROR HANDLERS
 # ============================================================================
+
+def _http_success(message: str | None = None, status: int = 200, **extra):
+    payload = {'success': True}
+    if message:
+        payload['message'] = message
+    payload.update(extra)
+    return jsonify(payload), status
+
+
+def _http_error(message: str, status: int = 400, **extra):
+    payload = {'success': False, 'message': message}
+    payload.update(extra)
+    return jsonify(payload), status
+
+
+@app.get("/api/activity")
+def api_activity_feed():
+    """Return recent backend activity entries with optional filtering."""
+    try:
+        limit = int(request.args.get('limit', 500))
+    except Exception:
+        limit = 500
+    limit = max(1, min(limit, ACTIVITY_LOG_MAX))
+    event_filter = request.args.get('event')
+
+    with _activity_log_lock:
+        entries = list(activity_log)
+
+    if event_filter:
+        entries = [entry for entry in entries if entry.get('event') == event_filter]
+
+    if len(entries) > limit:
+        entries = entries[-limit:]
+
+    return jsonify({
+        'entries': entries,
+        'returned': len(entries),
+        'total': len(activity_log),
+    })
+
+
+@app.get("/api/activity/types")
+def api_activity_types():
+    """Expose the set of known activity event types."""
+    with _activity_log_lock:
+        events = sorted({entry.get('event', 'general') for entry in activity_log})
+    return jsonify({'events': events, 'count': len(events)})
+
+
+@app.get("/api/activity/download")
+def api_activity_download():
+    """Provide a text download of the current activity log."""
+    with _activity_log_lock:
+        entries = list(activity_log)
+
+    lines: list[str] = []
+    for entry in entries:
+        iso = entry.get('isoTime') or time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(entry.get('timestamp', time.time())))
+        level = entry.get('level', 'INFO')
+        event = entry.get('event', 'general')
+        message = entry.get('message', '')
+        meta = entry.get('meta')
+        meta_str = ''
+        if meta not in (None, '', {}):
+            try:
+                meta_str = json.dumps(meta, ensure_ascii=True)
+            except Exception:
+                meta_str = str(meta)
+        line = f"[{iso}] [{level}] ({event}) {message}"
+        if meta_str:
+            line = f"{line} | meta={meta_str}"
+        lines.append(line)
+
+    payload = "\n".join(lines)
+    headers = {
+        'Content-Disposition': 'attachment; filename=\"nrp-activity.log\"'
+    }
+    return Response(payload, mimetype='text/plain', headers=headers)
+
+
+@app.post("/api/arm")
+def api_arm_vehicle():
+    body = request.get_json(silent=True) or {}
+    arm_value = bool(body.get('value', body.get('arm', True)))
+    try:
+        result = _handle_arm_disarm({'arm': arm_value})
+        message = result.get('message') if isinstance(result, dict) else None
+        return _http_success(message or "Arm command dispatched")
+    except Exception as exc:
+        log_message(f"/api/arm error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/set_mode")
+def api_set_mode():
+    body = request.get_json(silent=True) or {}
+    mode = str(body.get('mode') or '').strip()
+    if not mode:
+        return _http_error("Missing mode", 400)
+    try:
+        result = _handle_set_mode({'mode': mode})
+        message = result.get('message') if isinstance(result, dict) else None
+        return _http_success(message or f"Mode change requested: {mode}")
+    except Exception as exc:
+        log_message(f"/api/set_mode error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/upload")
+def api_mission_upload():
+    body = request.get_json(silent=True) or {}
+    waypoints = body.get('waypoints')
+    if not isinstance(waypoints, list) or not waypoints:
+        return _http_error("No waypoints provided", 400)
+    payload = {
+        'waypoints': waypoints,
+        'servoConfig': body.get('servoConfig'),
+    }
+    try:
+        result = _handle_upload_mission(payload)
+        message = result.get('message') if isinstance(result, dict) else None
+        count = len(waypoints)
+        return _http_success(message or f"Mission upload queued ({count} waypoints)", count=count)
+    except Exception as exc:
+        log_message(f"/api/mission/upload error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.get("/api/mission/download")
+def api_mission_download():
+    try:
+        result = _handle_get_mission({})
+        waypoints = result.get('waypoints', []) if isinstance(result, dict) else []
+        message = result.get('message') if isinstance(result, dict) else None
+        return _http_success(message or f"Mission retrieved ({len(waypoints)} waypoints)", waypoints=waypoints)
+    except Exception as exc:
+        log_message(f"/api/mission/download error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/clear")
+def api_mission_clear():
+    try:
+        result = _handle_clear_mission({})
+        message = result.get('message') if isinstance(result, dict) else None
+        return _http_success(message or "Mission cleared")
+    except Exception as exc:
+        log_message(f"/api/mission/clear error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/rtk/inject")
+def api_rtk_inject():
+    body = request.get_json(silent=True) or {}
+    ntrip_url = str(body.get('ntrip_url') or body.get('url') or '').strip()
+    if not ntrip_url:
+        return _http_error("Missing ntrip_url", 400)
+    log_message("REST RTK inject endpoint not yet implemented", "WARNING")
+    socketio.emit('rtk_log', {'message': 'REST RTK inject endpoint invoked but not implemented'})
+    return _http_error("RTK injection via REST is not supported yet. Use the Socket.IO control panel.", 501)
+
+
+@app.post("/api/servo/control")
+def api_servo_control():
+    body = request.get_json(silent=True) or {}
+    servo_id = body.get('servo_id')
+    angle = body.get('angle')
+    if servo_id is None or angle is None:
+        return _http_error("Missing servo_id or angle", 400)
+    log_message("REST servo control endpoint not yet implemented", "WARNING")
+    return _http_error("Direct servo control via REST is not available.", 501)
 
 @socketio.on_error_default
 def default_error_handler(e):
@@ -2146,25 +2676,26 @@ def servo_log():
         return jsonify({"error": str(e)}), 500
 
 
-if __name__ == '__main__':
-    try:
-        log_message("Starting Flask-SocketIO server...")
+try:
+    log_message("Starting Flask-SocketIO server...")
 
-        # Start cooperative background tasks under Socket.IO's greenlet scheduler
-        socketio.start_background_task(connect_to_drone)
-        log_message("Vehicle connection task started")
+    # Start cooperative background tasks under Socket.IO's greenlet scheduler
+    socketio.start_background_task(maintain_mavros_connection)
+    log_message("MAVROS connection maintenance task started")
 
-        socketio.start_background_task(process_mavlink_messages)
-        log_message("MAVLink message processing task started")
+    socketio.start_background_task(telemetry_loop)
+    log_message("Telemetry task started")
 
-        socketio.start_background_task(telemetry_loop)
-        log_message("Telemetry task started")
+    log_message("All background tasks started successfully", "SUCCESS")
+    log_message("Starting Flask-SocketIO server on http://0.0.0.0:5001", "SUCCESS")
 
-        log_message("All background tasks started successfully", "SUCCESS")
-        log_message("Starting Flask-SocketIO server on http://0.0.0.0:5001", "SUCCESS")
+    # This check prevents the dev server from running on module import,
+    # but allows direct execution (`python server.py`) to work.
+    if __name__ in ('__main__', 'Backend.server'):
+      socketio.run(app, host='0.0.0.0', port=5001, debug=False)
 
-        socketio.run(app, host='0.0.0.0', port=5001, debug=False)
-
-    except Exception as e:
-        log_message(f"Failed to start server: {e}", "ERROR")
-        raise e
+except Exception as e:
+    log_message(f"Failed to start server: {e}", "ERROR")
+    # Ensure ROS cleanup happens even on startup failure
+    _shutdown_ros_runtime()
+    raise e

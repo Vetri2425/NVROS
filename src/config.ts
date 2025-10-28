@@ -10,7 +10,7 @@ export const BACKEND_IP = window.location.hostname;
 /**
  * Defines the port the backend server is running on.
  */
-export const BACKEND_PORT = 5000; // Your backend port
+export const BACKEND_PORT = 5001; // Your backend port
 
 /**
  * The full URL for the backend API.
