@@ -1,6 +1,8 @@
 import React, { useRef, useState } from 'react';
 import CircleTool from '../../tools/CircleTool';
 import PolygonTool from '../../tools/PolygonTool';
+import SurveyGridTool from '../../tools/SurveyGridTool';
+import SplineWaypointTool from '../../tools/SplineWaypointTool';
 import { ChevronDownIcon } from '../icons/ChevronDownIcon';
 import { MissionFileInfo, Waypoint } from '../../types';
 import { parseMissionFile, ParsedWaypoint } from '../../utils/missionParser';
@@ -37,9 +39,13 @@ const PlanControls: React.FC<PlanControlsProps> = ({
   const [isWriting, setIsWriting] = useState(false);
   const [lastWriteStatus, setLastWriteStatus] = useState<null | 'success' | 'error'>(null);
   const [isReading, setIsReading] = useState(false);
+  const [lastReadStatus, setLastReadStatus] = useState<null | 'success' | 'error' | 'empty'>(null);
+  const [readErrorMessage, setReadErrorMessage] = useState<string | null>(null);
   const [currentFile, setCurrentFile] = useState<MissionFileInfo | null>(null);
   const [showCircleTool, setShowCircleTool] = useState(false);
   const [showPolygonTool, setShowPolygonTool] = useState(false);
+  const [showSurveyGridTool, setShowSurveyGridTool] = useState(false);
+  const [showSplineTool, setShowSplineTool] = useState(false);
 
   React.useEffect(() => {
     if (missionFileInfo) {
@@ -124,9 +130,53 @@ const PlanControls: React.FC<PlanControlsProps> = ({
   };
 
   const handleReadFromRover = async () => {
+    if (!isConnected) {
+      setReadErrorMessage('Rover not connected. Please connect to the rover first.');
+      setLastReadStatus('error');
+      setTimeout(() => {
+        setReadErrorMessage(null);
+        setLastReadStatus(null);
+      }, 5000);
+      return;
+    }
+
     setIsReading(true);
+    setReadErrorMessage(null);
+    setLastReadStatus(null);
+
     try {
       await onReadFromRover();
+      
+      // Check if we actually got waypoints
+      // Note: This check happens after onReadFromRover updates the mission
+      // We'll add a small delay to let state update
+      setTimeout(() => {
+        if (missionWaypoints.length === 0) {
+          setLastReadStatus('empty');
+          setReadErrorMessage('Rover mission is empty. No waypoints to download.');
+        } else {
+          setLastReadStatus('success');
+          setReadErrorMessage(null);
+        }
+        
+        // Clear status after 5 seconds
+        setTimeout(() => {
+          setLastReadStatus(null);
+          setReadErrorMessage(null);
+        }, 5000);
+      }, 100);
+      
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Failed to download mission from rover';
+      setReadErrorMessage(errorMsg);
+      setLastReadStatus('error');
+      console.error('Mission download error:', error);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setReadErrorMessage(null);
+        setLastReadStatus(null);
+      }, 5000);
     } finally {
       setIsReading(false);
     }
@@ -201,6 +251,14 @@ const PlanControls: React.FC<PlanControlsProps> = ({
               <div className="text-xs text-slate-300 mb-2">Auto Waypoint Tools</div>
               <div className="space-y-2">
                 <button
+                  onClick={() => setShowSurveyGridTool(true)}
+                  className="w-full bg-green-700 hover:bg-green-800 text-white py-2 rounded-md text-sm font-medium flex items-center justify-center gap-2"
+                >
+                  <span>📐</span>
+                  <span>Survey Grid</span>
+                  <span className="text-xs bg-green-900 px-1.5 py-0.5 rounded">MP Style</span>
+                </button>
+                <button
                   onClick={() => setShowPolygonTool(true)}
                   className="w-full bg-purple-700 hover:bg-purple-800 text-white py-2 rounded-md text-sm font-medium"
                 >
@@ -211,6 +269,14 @@ const PlanControls: React.FC<PlanControlsProps> = ({
                   className="w-full bg-sky-700 hover:bg-sky-800 text-white py-2 rounded-md text-sm font-medium"
                 >
                   🌀 Generate Circle
+                </button>
+                <button
+                  onClick={() => setShowSplineTool(true)}
+                  disabled={missionWaypoints.length === 0}
+                  className="w-full bg-indigo-700 hover:bg-indigo-800 disabled:opacity-50 disabled:cursor-not-allowed text-white py-2 rounded-md text-sm font-medium"
+                  title="Convert waypoints to smooth spline paths"
+                >
+                  〰️ Convert to Spline
                 </button>
               </div>
             </div>
@@ -226,12 +292,42 @@ const PlanControls: React.FC<PlanControlsProps> = ({
                 disabled={!isConnected || isReading}
                 className={`w-full px-4 py-2 rounded-md transition-all duration-200 text-sm font-medium mb-2 ${
                   isConnected && !isReading
-                    ? 'bg-purple-600 hover:bg-purple-700 text-white'
+                    ? lastReadStatus === 'success'
+                      ? 'bg-green-600 hover:bg-green-700 text-white'
+                      : lastReadStatus === 'error'
+                      ? 'bg-red-600 hover:bg-red-700 text-white'
+                      : lastReadStatus === 'empty'
+                      ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
+                      : 'bg-purple-600 hover:bg-purple-700 text-white'
                     : 'bg-gray-500 text-gray-300 cursor-not-allowed'
                 }`}
               >
-                {isReading ? 'Reading...' : '📥 Read from Rover'}
+                {isReading 
+                  ? '⏳ Reading...' 
+                  : lastReadStatus === 'success'
+                  ? '✅ Downloaded'
+                  : lastReadStatus === 'error'
+                  ? '❌ Failed'
+                  : lastReadStatus === 'empty'
+                  ? '⚠️ Empty Mission'
+                  : '📥 Read from Rover'}
               </button>
+
+              {/* Error/Success Message Display */}
+              {readErrorMessage && (
+                <div className={`mb-2 p-2 rounded text-xs ${
+                  lastReadStatus === 'error' 
+                    ? 'bg-red-900/50 text-red-200 border border-red-700'
+                    : lastReadStatus === 'empty'
+                    ? 'bg-yellow-900/50 text-yellow-200 border border-yellow-700'
+                    : 'bg-blue-900/50 text-blue-200 border border-blue-700'
+                }`}>
+                  <div className="font-semibold mb-1">
+                    {lastReadStatus === 'error' ? '⚠️ Download Failed' : 'ℹ️ Info'}
+                  </div>
+                  <div>{readErrorMessage}</div>
+                </div>
+              )}
 
               <button
                 onClick={handleWriteToRover}
@@ -325,6 +421,37 @@ const PlanControls: React.FC<PlanControlsProps> = ({
           })
         }
         onClose={() => setShowPolygonTool(false)}
+      />
+      )}
+      {showSurveyGridTool && (
+        <SurveyGridTool
+        onGenerate={(wps) =>
+          onUpload(wps, {
+            name: 'Survey Grid Mission',
+            size: 0,
+            type: 'generated',
+            uploadedAt: new Date().toISOString(),
+            waypointCount: wps.length,
+            source: 'generated',
+          })
+        }
+        onClose={() => setShowSurveyGridTool(false)}
+      />
+      )}
+      {showSplineTool && (
+        <SplineWaypointTool
+        currentWaypoints={missionWaypoints}
+        onConvert={(wps) =>
+          onUpload(wps, {
+            name: currentFile?.name.replace('.waypoints', '_spline.waypoints') || 'Spline Mission',
+            size: 0,
+            type: 'generated',
+            uploadedAt: new Date().toISOString(),
+            waypointCount: wps.length,
+            source: 'generated',
+          })
+        }
+        onClose={() => setShowSplineTool(false)}
       />
       )}
     </>

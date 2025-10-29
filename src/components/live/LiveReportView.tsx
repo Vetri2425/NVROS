@@ -24,6 +24,8 @@ const LiveReportView: React.FC<LiveReportViewProps> = ({
       ? liveRoverData.activeWaypointIndex + 1
       : null;
 
+  const currentWaypointSeq = liveRoverData.mission_progress?.current || liveRoverData.activeWaypointIndex || 0;
+
   return (
     <div className="flex-1 flex flex-col p-4 gap-4 overflow-hidden">
       {/* Top section with 3 panels */}
@@ -57,6 +59,7 @@ const LiveReportView: React.FC<LiveReportViewProps> = ({
         <aside className="w-[240px] flex-shrink-0">
           <LiveControls 
             isConnected={isConnected}
+            currentWaypoint={currentWaypointSeq}
           />
         </aside>
       </div>

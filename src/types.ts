@@ -81,6 +81,28 @@ export interface RoverData {
   completedWaypointIds: number[];
   distanceToNext: number;
   
+  // --- Servo Output (PWM Values) ---
+  servo_output?: {
+    channels: number[];
+    count: number;
+    servo1_pwm?: number;
+    servo2_pwm?: number;
+    servo3_pwm?: number;
+    servo4_pwm?: number;
+    servo5_pwm?: number;
+    servo6_pwm?: number;
+    servo7_pwm?: number;
+    servo8_pwm?: number;
+    servo9_pwm?: number;
+    servo10_pwm?: number;
+    servo11_pwm?: number;
+    servo12_pwm?: number;
+    servo13_pwm?: number;
+    servo14_pwm?: number;
+    servo15_pwm?: number;
+    servo16_pwm?: number;
+  };
+  
   // --- Metadata ---
   lastUpdate: string | number;
   telemetryAgeMs?: number;

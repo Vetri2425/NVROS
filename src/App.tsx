@@ -190,16 +190,55 @@ const AppContent: React.FC = () => {
     try {
       const response = await services.downloadMission();
       const fetched = Array.isArray((response as any).waypoints) ? (response as any).waypoints : [];
+      
       if (response.success && fetched.length > 0) {
-        handleMissionDownloaded(fetched);
-        alert(`Downloaded ${fetched.length} waypoints from rover.`);
+        // Validate waypoints before accepting them
+        const validWaypoints = fetched.filter((wp: any) => {
+          const hasValidCoords = 
+            typeof wp.lat === 'number' && 
+            typeof wp.lng === 'number' &&
+            !isNaN(wp.lat) && 
+            !isNaN(wp.lng) &&
+            Math.abs(wp.lat) <= 90 && 
+            Math.abs(wp.lng) <= 180 &&
+            !(wp.lat === 0 && wp.lng === 0); // Reject null island
+          
+          if (!hasValidCoords) {
+            console.warn('Invalid waypoint coordinates:', wp);
+          }
+          return hasValidCoords;
+        });
+
+        if (validWaypoints.length === 0) {
+          throw new Error('All downloaded waypoints have invalid coordinates');
+        }
+
+        if (validWaypoints.length < fetched.length) {
+          console.warn(`Filtered out ${fetched.length - validWaypoints.length} invalid waypoints`);
+        }
+
+        handleMissionDownloaded(validWaypoints);
+        
+        const warningMsg = (response as any).warning;
+        if (warningMsg === 'timeout') {
+          alert(`⚠️ ${response.message || `Downloaded ${validWaypoints.length} waypoints (with timeout warning)`}`);
+        } else if (warningMsg === 'fallback') {
+          alert(`⚠️ ${response.message || `Using cached ${validWaypoints.length} waypoints`}`);
+        } else if (validWaypoints.length < fetched.length) {
+          alert(`✅ Downloaded ${validWaypoints.length} valid waypoints (${fetched.length - validWaypoints.length} invalid filtered out)`);
+        } else {
+          alert(`✅ Downloaded ${validWaypoints.length} waypoints from rover`);
+        }
       } else if (response.success) {
-        alert('Rover mission is empty.');
+        throw new Error('Rover mission is empty');
       } else {
-        alert(response.message ?? 'Failed to download mission from rover.');
+        throw new Error(response.message ?? 'Failed to download mission from rover');
       }
     } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to download mission from rover.');
+      const errorMsg = error instanceof Error ? error.message : 'Failed to download mission from rover';
+      console.error('Mission download error:', error);
+      // Error is now handled in PlanControls with better UI feedback
+      throw error; // Re-throw to let PlanControls handle it
     }
   }, [services, handleMissionDownloaded]);
 

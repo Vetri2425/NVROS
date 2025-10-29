@@ -224,6 +224,30 @@ const toTelemetryEnvelopeFromRoverData = (data: any): TelemetryEnvelope | null =
     touched = true;
   }
 
+  // Handle servo_output telemetry
+  if (data.servo_output && typeof data.servo_output === 'object') {
+    const servoOutput = data.servo_output;
+    const servoPwmValues: Partial<ServoStatus> = {
+      servo_id: 0,
+      active: false,
+      last_command_ts: 0,
+    };
+
+    // Map individual servo PWM values
+    if (Array.isArray(servoOutput.channels)) {
+      servoPwmValues.pwm_values = servoOutput.channels;
+      for (let i = 1; i <= 16; i++) {
+        const key = `servo${i}_pwm` as keyof ServoStatus;
+        if (servoOutput[key] !== undefined) {
+          (servoPwmValues as any)[key] = servoOutput[key];
+        }
+      }
+    }
+
+    envelope.servo = servoPwmValues as ServoStatus;
+    touched = true;
+  }
+
   return touched ? (envelope as TelemetryEnvelope) : null;
 };
 
@@ -274,7 +298,12 @@ export interface RoverServices {
   uploadMission: (waypoints: Waypoint[]) => Promise<ServiceResponse>;
   downloadMission: () => Promise<ServiceResponse & { waypoints?: Waypoint[] }>;
   clearMission: () => Promise<ServiceResponse>;
+  setCurrentWaypoint: (wpSeq: number) => Promise<ServiceResponse>;
+  pauseMission: () => Promise<ServiceResponse>;
+  resumeMission: () => Promise<ServiceResponse>;
   injectRTK: (ntripUrl: string) => Promise<ServiceResponse>;
+  stopRTK: () => Promise<ServiceResponse>;
+  getRTKStatus: () => Promise<ServiceResponse & { running?: boolean; caster?: any; total_bytes?: number }>;
   controlServo: (servoId: number, angle: number) => Promise<ServiceResponse>;
 }
 
@@ -601,7 +630,12 @@ const services = useMemo<RoverServices>(
     uploadMission: (waypoints: Waypoint[]) => postService('/mission/upload', { waypoints }),
     downloadMission: () => getService('/mission/download'),
     clearMission: () => postService('/mission/clear'),
+    setCurrentWaypoint: (wpSeq: number) => postService('/mission/set_current', { wp_seq: wpSeq }),
+    pauseMission: () => postService('/mission/pause'),
+    resumeMission: () => postService('/mission/resume'),
     injectRTK: (ntripUrl: string) => postService('/rtk/inject', { ntrip_url: ntripUrl }),
+    stopRTK: () => postService('/rtk/stop'),
+    getRTKStatus: () => getService('/rtk/status'),
     controlServo: (servoId: number, angle: number) =>
       postService('/servo/control', { servo_id: servoId, angle }),
   }),

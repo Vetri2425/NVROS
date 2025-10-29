@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="/home/flash/NRP"
+PROJECT_ROOT="/home/flash/NRP_ROS"
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
 declare -a CHILD_PIDS=()
@@ -99,7 +99,7 @@ start_ros_process() {
     local pid=$!
 
     for i in {1..30}; do
-        if check_ros_node "$node_pattern"; then
+        if [[ -z "$node_pattern" ]] || check_ros_node "$node_pattern"; then
             log "$name is ready"
             CHILD_PIDS+=("$pid")
             return 0
@@ -166,13 +166,20 @@ start_ros_process "MAVROS" \
     "ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:115200 gcs_url:=tcp-l://0.0.0.0:5761" \
     "/mavros" || exit 1
 
+start_ros_process "Telemetry Node" \
+    "python3 -m Backend.telemetry_node" \
+    ""
+
 start_backend || exit 1
 
 log "Active ROS nodes:"
 ros2 node list || true
+
+sudo systemctl restart rosbridge.service
 
 # cd "$PROJECT_ROOT"
 # log "Starting NRP frontend..."
 # npm run dev:frontend &
 # NPM_PID=$!
 # wait "$NPM_PID"
+

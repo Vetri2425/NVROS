@@ -61,6 +61,33 @@ header {
 .toolbar button:hover {
     background: #1d4ed8;
 }
+.tabs {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+.tab-button {
+    background: #374151;
+    color: #e2e8f0;
+    border: 1px solid #4b5563;
+    border-radius: 0.35rem;
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    font-weight: 600;
+}
+.tab-button:hover {
+    background: #4b5563;
+}
+.tab-button.active {
+    background: #2563eb;
+    border-color: #2563eb;
+}
+.tab-content {
+    display: none;
+}
+.tab-content.active {
+    display: block;
+}
 .status-strip {
     display: flex;
     gap: 1.5rem;
@@ -156,47 +183,74 @@ code {
 <body>
 <header>NRP Backend Activity Monitor</header>
 <div class="page">
-    <div class="toolbar">
-        <label>
-            Event type
-            <select id="event-filter">
-                <option value="">All events</option>
-            </select>
-        </label>
-        <label>
-            Text filter
-            <input type="text" id="text-filter" placeholder="Search message or meta">
-        </label>
-        <label>
-            <span>Display options</span>
-            <span>
-                <input type="checkbox" id="auto-scroll" checked> Auto-scroll
+    <div class="tabs">
+        <button class="tab-button active" data-tab="activity">Activity</button>
+        <button class="tab-button" data-tab="nodes">Node Status</button>
+    </div>
+    <div id="activity-tab" class="tab-content active">
+        <div class="toolbar">
+            <label>
+                Event type
+                <select id="event-filter">
+                    <option value="">All events</option>
+                </select>
+            </label>
+            <label>
+                Text filter
+                <input type="text" id="text-filter" placeholder="Search message or meta">
+            </label>
+            <label>
+                <span>Display options</span>
+                <span>
+                    <input type="checkbox" id="auto-scroll" checked> Auto-scroll
+                </span>
+            </label>
+            <button id="refresh-button" type="button">Refresh</button>
+            <button id="download-button" type="button">Download</button>
+        </div>
+        <div class="status-strip">
+            <span>Socket:
+                <span id="socket-status" class="status-pill warn">Connecting</span>
             </span>
-        </label>
-        <button id="refresh-button" type="button">Refresh</button>
-        <button id="download-button" type="button">Download</button>
+            <span>Showing <span id="result-count">0</span> entries</span>
+            <span>Last update <span id="last-updated">-</span></span>
+        </div>
+        <div class="log-container">
+            <div class="log-scroll" id="log-scroll">
+                <table id="activity-table">
+                    <thead>
+                        <tr>
+                            <th>Time (UTC)</th>
+                            <th>Level</th>
+                            <th>Event</th>
+                            <th>Message</th>
+                            <th>Meta</th>
+                        </tr>
+                    </thead>
+                    <tbody id="activity-body"></tbody>
+                </table>
+            </div>
+        </div>
     </div>
-    <div class="status-strip">
-        <span>Socket:
-            <span id="socket-status" class="status-pill warn">Connecting</span>
-        </span>
-        <span>Showing <span id="result-count">0</span> entries</span>
-        <span>Last update <span id="last-updated">-</span></span>
-    </div>
-    <div class="log-container">
-        <div class="log-scroll" id="log-scroll">
-            <table id="activity-table">
-                <thead>
-                    <tr>
-                        <th>Time (UTC)</th>
-                        <th>Level</th>
-                        <th>Event</th>
-                        <th>Message</th>
-                        <th>Meta</th>
-                    </tr>
-                </thead>
-                <tbody id="activity-body"></tbody>
-            </table>
+    <div id="nodes-tab" class="tab-content">
+        <div class="toolbar">
+            <button id="refresh-nodes-button" type="button">Refresh Nodes</button>
+        </div>
+        <div class="status-strip">
+            <span>ROS Nodes: <span id="node-count">0</span></span>
+            <span>Last update <span id="nodes-last-updated">-</span></span>
+        </div>
+        <div class="log-container">
+            <div class="log-scroll" id="nodes-scroll">
+                <table id="nodes-table">
+                    <thead>
+                        <tr>
+                            <th>Node Name</th>
+                        </tr>
+                    </thead>
+                    <tbody id="nodes-body"></tbody>
+                </table>
+            </div>
         </div>
     </div>
 </div>
@@ -217,6 +271,58 @@ code {
     const downloadButton = document.getElementById('download-button');
     const knownEvents = new Set();
     let renderQueued = false;
+
+    // Tab switching
+    const tabButtons = document.querySelectorAll('.tab-button');
+    const tabContents = document.querySelectorAll('.tab-content');
+    tabButtons.forEach(button => {
+        button.addEventListener('click', () => {
+            tabButtons.forEach(btn => btn.classList.remove('active'));
+            tabContents.forEach(content => content.classList.remove('active'));
+            button.classList.add('active');
+            const tabId = button.getAttribute('data-tab') + '-tab';
+            document.getElementById(tabId).classList.add('active');
+        });
+    });
+
+    // Nodes functionality
+    const nodesBody = document.getElementById('nodes-body');
+    const nodeCountEl = document.getElementById('node-count');
+    const nodesLastUpdatedEl = document.getElementById('nodes-last-updated');
+    const refreshNodesButton = document.getElementById('refresh-nodes-button');
+
+    async function loadNodes() {
+        try {
+            const response = await fetch('/api/nodes');
+            const data = await response.json();
+            nodesBody.innerHTML = '';
+            if (Array.isArray(data.nodes)) {
+                data.nodes.forEach(node => {
+                    const tr = document.createElement('tr');
+                    const td = document.createElement('td');
+                    const link = document.createElement('a');
+                    link.href = `/node/${encodeURIComponent(node)}`;
+                    link.textContent = node;
+                    link.style.color = '#60a5fa';
+                    link.style.textDecoration = 'none';
+                    link.addEventListener('mouseover', () => link.style.textDecoration = 'underline');
+                    link.addEventListener('mouseout', () => link.style.textDecoration = 'none');
+                    td.appendChild(link);
+                    tr.appendChild(td);
+                    nodesBody.appendChild(tr);
+                });
+                nodeCountEl.textContent = data.count;
+            } else {
+                nodeCountEl.textContent = 'Error';
+            }
+            nodesLastUpdatedEl.textContent = new Date().toISOString();
+        } catch (err) {
+            console.error('Failed to fetch nodes', err);
+            nodeCountEl.textContent = 'Error';
+        }
+    }
+
+    refreshNodesButton.addEventListener('click', loadNodes);
 
     function classForLevel(level) {
         if (!level) {
@@ -406,6 +512,7 @@ code {
 
     loadInitial();
     refreshTypes();
+    loadNodes();
 })();</script>
 </body>
 </html>

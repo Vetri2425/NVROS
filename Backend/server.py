@@ -367,6 +367,8 @@ class CurrentState:
     activeWaypointIndex: Optional[int] = None
     completedWaypointIds: List[int] = field(default_factory=list)
     distanceToNext: float = 0.0
+    # Servo output telemetry (PWM values from /mavros/rc/out)
+    servo_output: Optional[dict] = None
     # Timestamp pushed to frontend (seconds since epoch)
     last_update: Optional[float] = None
 
@@ -1185,6 +1187,15 @@ def _handle_mavros_telemetry(message: dict) -> None:
                     waypoint_id=waypoint_id
                 )
                 schedule_fast_emit()
+
+        elif msg_type == "servo_output":
+            servo_state = message.get("servo_output")
+            if servo_state and isinstance(servo_state, dict):
+                with mavros_telem_lock:
+                    current_state.servo_output = servo_state
+                    current_state.last_update = time.time()
+                schedule_fast_emit()
+
     except Exception as exc:
         log_message(f"MAVROS telemetry handler error: {exc}", "ERROR")
 
@@ -1332,18 +1343,43 @@ def _handle_goto(data):
 
 
 def _handle_upload_mission(data):
-    """Upload a mission via Socket.IO to the Pixhawk."""
+    """
+    Upload a mission to the rover via MAVROS.
+    
+    This is the centralized mission upload handler used by both:
+    - REST API /api/mission/upload
+    - Socket.IO mission_upload (deprecated)
+    
+    Args:
+        data: Dict with 'waypoints' (required) and optional 'servoConfig'
+        
+    Returns:
+        Dict with status and message
+    """
     global current_mission
     bridge = _require_vehicle_bridge()
+    
     waypoints = data.get("waypoints")
     if not isinstance(waypoints, list) or not waypoints:
         raise ValueError("Mission upload requires waypoints")
+    
+    # Apply servo configuration if provided
+    servo_config = data.get("servoConfig")
+    if servo_config:
+        log_message(f"[mission_upload] Applying servo mode: {servo_config.get('mode')}", "INFO")
+        waypoints = apply_servo_modes(waypoints, servo_config)
+    
     mission_count = len(waypoints)
-    log_message(f"Mission upload initiated for {mission_count} waypoint(s)")
+    log_message(f"[mission_upload] Uploading {mission_count} waypoint(s) via MAVROS", "INFO")
+    
+    # Convert to MAVROS format and push to vehicle
     mavros_waypoints = _build_mavros_waypoints(waypoints)
     response = bridge.push_waypoints(mavros_waypoints)
+    
     if not response.get("success", False):
         raise RuntimeError(f"MAVROS mission push failed: {response}")
+    
+    # Update mission state
     current_mission = list(waypoints)
     with mavros_telem_lock:
         current_state.completedWaypointIds = []
@@ -1351,11 +1387,15 @@ def _handle_upload_mission(data):
         current_state.current_waypoint_id = None
         mission_log_state['last_active_seq'] = None
         mission_log_state['last_reached_seq'] = None
+    
+    # Record activity
     _record_mission_event(
         f"Mission uploaded ({mission_count} items)",
         status='MISSION_UPLOADED'
     )
+    
     log_message(f"Mission uploaded successfully via MAVROS ({mission_count} waypoints)", "SUCCESS")
+    
     return {
         "status": "success",
         "message": f"Mission uploaded ({mission_count} waypoints)"
@@ -1363,23 +1403,69 @@ def _handle_upload_mission(data):
 
 
 def _handle_get_mission(data):
-    """Handle GET_MISSION command."""
+    """
+    Handle mission download from vehicle.
+    
+    Returns waypoints from vehicle if available, otherwise returns cached mission.
+    Provides clear error messages for different failure scenarios.
+    """
     global current_mission
-    _require_vehicle_bridge()
+    bridge = _require_vehicle_bridge()
+    
     try:
+        log_message("[MISSION] Downloading mission from vehicle...", "INFO")
         mission_waypoints = download_mission_from_vehicle()
+        
+        if not mission_waypoints or len(mission_waypoints) == 0:
+            log_message("[MISSION] Downloaded empty mission from vehicle", "INFO")
+            return {
+                'status': 'success',
+                'message': 'Rover mission is empty (0 waypoints)',
+                'waypoints': []
+            }
+        
+        log_message(f"[MISSION] Successfully downloaded {len(mission_waypoints)} waypoints", "SUCCESS")
         return {
             'status': 'success',
-            'message': f'Downloaded {len(mission_waypoints)} waypoints',
+            'message': f'Downloaded {len(mission_waypoints)} waypoints from rover',
             'waypoints': mission_waypoints
         }
+        
+    except TimeoutError as e:
+        log_message(f"[MISSION] Download timeout: {e}", "ERROR")
+        if current_mission and len(current_mission) > 0:
+            return {
+                'status': 'success',
+                'message': f'Download timed out. Using cached mission ({len(current_mission)} waypoints)',
+                'waypoints': current_mission,
+                'warning': 'timeout'
+            }
+        raise TimeoutError("Mission download timed out. Please check MAVROS connection and try again.")
+        
+    except ConnectionError as e:
+        log_message(f"[MISSION] Connection error during download: {e}", "ERROR")
+        raise ConnectionError("Unable to connect to rover. Please check MAVROS bridge is running.")
+        
     except Exception as e:
-        log_message(f"Mission download failed: {e}", "WARNING")
-        return {
-            'status': 'success',
-            'message': f'Using cached mission: {len(current_mission)} waypoints',
-            'waypoints': current_mission
-        }
+        log_message(f"[MISSION] Download failed: {e}", "ERROR")
+        
+        # Try to provide cached mission as fallback
+        if current_mission and len(current_mission) > 0:
+            return {
+                'status': 'success',
+                'message': f'Download failed. Using cached mission ({len(current_mission)} waypoints)',
+                'waypoints': current_mission,
+                'warning': 'fallback'
+            }
+        
+        # No cached mission available
+        error_msg = str(e)
+        if "not available" in error_msg.lower():
+            raise RuntimeError("MAVROS service not available. Please check rosbridge connection.")
+        elif "timeout" in error_msg.lower():
+            raise TimeoutError("Mission download timed out. Vehicle may not be responding.")
+        else:
+            raise RuntimeError(f"Mission download failed: {error_msg}")
 
 
 def _handle_clear_mission(_data=None):
@@ -1424,64 +1510,42 @@ def handle_request_mission_logs():
 # ============================================================================
 # MISSION UPLOAD/DOWNLOAD
 # ============================================================================
+# NOTE: Socket.IO mission_upload handler is DEPRECATED.
+# All mission uploads should use REST API /api/mission/upload
+# which properly integrates with MAVROS through _handle_upload_mission().
+#
+# This Socket.IO handler is kept only for backward compatibility but
+# now redirects to the same MAVROS implementation.
 
 @socketio.on("mission_upload")
 def on_mission_upload(data):
-    """Mission upload via Socket.IO with progress updates."""
+    """
+    DEPRECATED: Mission upload via Socket.IO.
+    Use REST API /api/mission/upload instead.
+    
+    This handler redirects to _handle_upload_mission() for MAVROS integration.
+    """
     global current_mission
+    
+    log_message("[mission_upload] Socket.IO upload called (DEPRECATED - use REST API)", "WARNING")
 
     try:
-        bridge = _require_vehicle_bridge()
-    except Exception as exc:
-        emit("mission_uploaded", {"ok": False, "error": str(exc)})
-        return
-
-    waypoints = data.get("waypoints", [])
-    servo_config = data.get("servoConfig")
-
-    if not waypoints:
-        emit("mission_uploaded", {"ok": False, "error": "No waypoints provided"})
-        return
-
-    if servo_config:
-        log_message(f"[mission_upload] Applying servo mode: {servo_config.get('mode')}")
-        waypoints = apply_servo_modes(waypoints, servo_config)
-
-    mission_count = len(waypoints)
-    log_message(f"[mission_upload] Uploading {mission_count} waypoints via MAVROS")
-
-    if not mission_upload_lock.acquire(blocking=False):
-        emit("mission_uploaded", {"ok": False, "error": "Upload in progress"})
-        return
-
-    try:
-        socketio.emit('mission_upload_progress', {'progress': 5})
-        mavros_waypoints = _build_mavros_waypoints(waypoints)
-        response = bridge.push_waypoints(mavros_waypoints)
-        if not response.get("success", False):
-            raise RuntimeError(f"MAVROS mission push failed: {response}")
-
-        current_mission = list(waypoints)
-        with mavros_telem_lock:
-            current_state.completedWaypointIds = []
-            current_state.activeWaypointIndex = None
-            current_state.current_waypoint_id = None
-            mission_log_state['last_active_seq'] = None
-            mission_log_state['last_reached_seq'] = None
-        _record_mission_event(
-            f"Mission uploaded ({mission_count} items)",
-            status='MISSION_UPLOADED'
-        )
+        # Use the centralized handler that REST API uses
+        result = _handle_upload_mission(data)
+        
+        # Emit progress events for backward compatibility
         socketio.emit('mission_upload_progress', {'progress': 100})
-        emit("mission_uploaded", {"ok": True, "count": mission_count})
+        
+        # Emit completion event with success response
+        emit("mission_uploaded", {
+            "ok": True,
+            "count": len(data.get("waypoints", [])),
+            "message": result.get("message", "Mission uploaded via MAVROS")
+        })
+        
     except Exception as e:
         log_message(f"[mission_upload] Error: {e}", "ERROR")
         emit("mission_uploaded", {"ok": False, "error": str(e)})
-    finally:
-        try:
-            mission_upload_lock.release()
-        except Exception:
-            pass
 
 
 def download_mission_from_vehicle():
@@ -1902,7 +1966,7 @@ def handle_command(data):
     command_type = data.get('command')
     log_message(f"Received command: {command_type}", event_type='ui_request')
     record_activity(
-        f"Socket command received: {command_type}",
+       
         event_type='ui_request',
         meta={
             'command': command_type,
@@ -1980,6 +2044,12 @@ def monitor_dashboard():
     `render_template`.
     """
     return render_template('monitor.html')
+
+
+@app.get("/node/<node_name>")
+def node_details(node_name):
+    """Serve the node details page."""
+    return render_template('node_details.html', node_name=node_name)
 
 
 # ============================================================================
@@ -2136,26 +2206,315 @@ def api_mission_clear():
         return _http_error(str(exc), 500)
 
 
+@app.post("/api/mission/set_current")
+def api_mission_set_current():
+    """
+    Set the current mission waypoint (skip to specific waypoint).
+    
+    Expected JSON body:
+    {
+        "wp_seq": 5  // 0-based waypoint sequence number
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    wp_seq = body.get('wp_seq')
+    
+    if wp_seq is None:
+        return _http_error("Missing wp_seq parameter", 400)
+    
+    try:
+        wp_seq_int = int(wp_seq)
+        if wp_seq_int < 0:
+            return _http_error("wp_seq must be >= 0", 400)
+        
+        bridge = _require_vehicle_bridge()
+        response = bridge.set_current_waypoint(wp_seq_int)
+        
+        log_message(f"[MISSION] Set current waypoint to {wp_seq_int}", "INFO")
+        
+        return _http_success(
+            f"Current waypoint set to {wp_seq_int}",
+            wp_seq=wp_seq_int
+        )
+    except Exception as exc:
+        log_message(f"/api/mission/set_current error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/pause")
+def api_mission_pause():
+    """
+    Pause mission execution by switching to HOLD mode.
+    """
+    try:
+        bridge = _require_vehicle_bridge()
+        
+        # Switch to HOLD mode to pause mission
+        response = bridge.set_mode(mode="HOLD")
+        
+        log_message("[MISSION] Mission paused (switched to HOLD mode)", "INFO")
+        _record_mission_event("Mission paused", status='MISSION_PAUSED')
+        
+        return _http_success("Mission paused (HOLD mode)")
+    except Exception as exc:
+        log_message(f"/api/mission/pause error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/resume")
+def api_mission_resume():
+    """
+    Resume mission execution by switching to AUTO mode.
+    """
+    try:
+        bridge = _require_vehicle_bridge()
+        
+        # Switch to AUTO mode to resume mission
+        response = bridge.set_mode(mode="AUTO")
+        
+        log_message("[MISSION] Mission resumed (switched to AUTO mode)", "INFO")
+        _record_mission_event("Mission resumed", status='MISSION_RESUMED')
+        
+        return _http_success("Mission resumed (AUTO mode)")
+    except Exception as exc:
+        log_message(f"/api/mission/resume error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
 @app.post("/api/rtk/inject")
 def api_rtk_inject():
+    """
+    Inject RTK corrections from an NTRIP caster.
+    
+    Expected JSON body:
+    {
+        "ntrip_url": "rtcm://user:pass@host:port/mountpoint"
+        OR
+        "host": "...", "port": 2101, "mountpoint": "...", "user": "...", "password": "..."
+    }
+    """
     body = request.get_json(silent=True) or {}
     ntrip_url = str(body.get('ntrip_url') or body.get('url') or '').strip()
-    if not ntrip_url:
-        return _http_error("Missing ntrip_url", 400)
-    log_message("REST RTK inject endpoint not yet implemented", "WARNING")
-    socketio.emit('rtk_log', {'message': 'REST RTK inject endpoint invoked but not implemented'})
-    return _http_error("RTK injection via REST is not supported yet. Use the Socket.IO control panel.", 501)
+    
+    # Parse NTRIP URL if provided (format: rtcm://user:pass@host:port/mountpoint)
+    if ntrip_url:
+        try:
+            from urllib.parse import urlparse
+            
+            # Handle both rtcm:// and http:// schemes
+            if ntrip_url.startswith('rtcm://'):
+                url = urlparse(ntrip_url.replace('rtcm://', 'http://'))
+            else:
+                url = urlparse(ntrip_url)
+            
+            caster_details = {
+                'host': url.hostname or '',
+                'port': url.port or 2101,
+                'mountpoint': url.path.lstrip('/') or '',
+                'user': url.username or '',
+                'password': url.password or ''
+            }
+        except Exception as e:
+            log_message(f"[RTK] Failed to parse NTRIP URL: {e}", "ERROR")
+            return _http_error(f"Invalid NTRIP URL format: {e}", 400)
+    else:
+        # Use individual parameters
+        caster_details = {
+            'host': str(body.get('host', '')).strip(),
+            'port': int(body.get('port', 2101)),
+            'mountpoint': str(body.get('mountpoint', '')).strip(),
+            'user': str(body.get('user') or body.get('username', '')).strip(),
+            'password': str(body.get('password', '')).strip()
+        }
+    
+    # Validate required fields
+    if not caster_details.get('host') or not caster_details.get('mountpoint'):
+        return _http_error("Missing host or mountpoint", 400)
+    if not caster_details.get('user') or not caster_details.get('password'):
+        return _http_error("Missing user or password", 400)
+    
+    # Use the existing Socket.IO handler
+    try:
+        with app.test_request_context():
+            handle_connect_caster(caster_details)
+        
+        log_message(f"[RTK] REST API triggered RTK injection to {caster_details['host']}", "INFO")
+        return jsonify({
+            'success': True,
+            'message': f"RTK stream started from {caster_details['host']}:{caster_details['port']}/{caster_details['mountpoint']}"
+        })
+    except Exception as exc:
+        log_message(f"/api/rtk/inject error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/rtk/stop")
+def api_rtk_stop():
+    """Stop the RTK corrections stream."""
+    global rtk_running
+    
+    if rtk_running:
+        log_message("[RTK] 🛑 REST API stop requested", "INFO")
+        rtk_running = False
+        return jsonify({
+            'success': True,
+            'message': 'RTK stream stopped successfully'
+        })
+    else:
+        return jsonify({
+            'success': True,
+            'message': 'RTK stream was not running'
+        })
+
+
+@app.get("/api/rtk/status")
+def api_rtk_status():
+    """Get the current RTK stream status."""
+    global rtk_running, rtk_current_caster, rtk_bytes_total
+    
+    with rtk_bytes_lock:
+        total_bytes = rtk_bytes_total
+    
+    return jsonify({
+        'success': True,
+        'running': rtk_running,
+        'caster': rtk_current_caster if rtk_running else None,
+        'total_bytes': total_bytes
+    })
 
 
 @app.post("/api/servo/control")
 def api_servo_control():
+    """
+    Control a servo directly via MAVROS.
+    
+    Expected JSON body:
+    {
+        "servo_id": 10,  // Servo channel number (1-16)
+        "angle": 90      // Angle in degrees (0-180) OR
+        "pwm": 1500      // Direct PWM value (1000-2000)
+    }
+    """
     body = request.get_json(silent=True) or {}
     servo_id = body.get('servo_id')
+    
+    if servo_id is None:
+        return _http_error("Missing servo_id", 400)
+    
+    # Accept either angle (0-180) or direct PWM (1000-2000)
     angle = body.get('angle')
-    if servo_id is None or angle is None:
-        return _http_error("Missing servo_id or angle", 400)
-    log_message("REST servo control endpoint not yet implemented", "WARNING")
-    return _http_error("Direct servo control via REST is not available.", 501)
+    pwm = body.get('pwm')
+    
+    if angle is None and pwm is None:
+        return _http_error("Missing angle or pwm parameter", 400)
+    
+    # Convert angle to PWM if needed
+    if pwm is None:
+        # Map angle (0-180) to PWM (1000-2000)
+        # Standard servo: 0° = 1000µs, 90° = 1500µs, 180° = 2000µs
+        angle_val = float(angle)
+        if angle_val < 0 or angle_val > 180:
+            return _http_error("Angle must be between 0 and 180", 400)
+        pwm_value = int(1000 + (angle_val / 180.0) * 1000)
+    else:
+        pwm_value = int(pwm)
+        if pwm_value < 1000 or pwm_value > 2000:
+            return _http_error("PWM must be between 1000 and 2000", 400)
+    
+    try:
+        bridge = _require_vehicle_bridge()
+        result = bridge.set_servo(int(servo_id), pwm_value)
+        
+        if result.get('success'):
+            log_message(f"[SERVO] Set servo {servo_id} to PWM {pwm_value}", "INFO")
+            return jsonify({
+                'success': True,
+                'message': f'Servo {servo_id} set to PWM {pwm_value}',
+                'servo_id': servo_id,
+                'pwm': pwm_value,
+                'angle': angle if angle is not None else None
+            })
+        else:
+            return _http_error(f"Servo command failed: result={result.get('result')}", 500)
+    except Exception as exc:
+        log_message(f"/api/servo/control error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+@app.get("/api/nodes")
+def api_nodes():
+    """Return list of active ROS 2 nodes."""
+    if not ROS_AVAILABLE:
+        return _http_error("ROS 2 not available", 503)
+    try:
+        import subprocess
+        result = subprocess.run(['ros2', 'node', 'list'], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            nodes = result.stdout.strip().split('\n')
+            nodes = [node.strip() for node in nodes if node.strip()]
+            return jsonify({'nodes': nodes, 'count': len(nodes)})
+        else:
+            return _http_error(f"Failed to list nodes: {result.stderr}", 500)
+    except Exception as exc:
+        log_message(f"/api/nodes error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+@app.get("/api/node/<node_name>")
+def api_node_info(node_name):
+    """Return detailed information about a specific ROS 2 node."""
+    if not ROS_AVAILABLE:
+        return _http_error("ROS 2 not available", 503)
+    try:
+        import subprocess
+        # Use the same command that works in the terminal
+        result = subprocess.run(['ros2', 'node', 'info', node_name], 
+                              capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            # Parse the output
+            lines = result.stdout.strip().split('\n')
+            info = {
+                'node_name': node_name,
+                'subscribers': [],
+                'publishers': [],
+                'service_servers': [],
+                'service_clients': [],
+                'action_servers': [],
+                'action_clients': []
+            }
+            
+            current_section = None
+            for line in lines[1:]:  # Skip the node name line
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith('Subscribers:'):
+                    current_section = 'subscribers'
+                elif line.startswith('Publishers:'):
+                    current_section = 'publishers'
+                elif line.startswith('Service Servers:'):
+                    current_section = 'service_servers'
+                elif line.startswith('Service Clients:'):
+                    current_section = 'service_clients'
+                elif line.startswith('Action Servers:'):
+                    current_section = 'action_servers'
+                elif line.startswith('Action Clients:'):
+                    current_section = 'action_clients'
+                elif current_section and line.startswith('/'):
+                    # Extract topic/service name and type
+                    if ':' in line:
+                        parts = line.split(':', 1)
+                        name = parts[0].strip()
+                        type_info = parts[1].strip()
+                        info[current_section].append({'name': name, 'type': type_info})
+                    else:
+                        info[current_section].append({'name': line, 'type': 'unknown'})
+            
+            return jsonify(info)
+        else:
+            return _http_error(f"Failed to get node info: {result.stderr}", 404)
+    except Exception as exc:
+        log_message(f"/api/node/{node_name} error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
 
 @socketio.on_error_default
 def default_error_handler(e):

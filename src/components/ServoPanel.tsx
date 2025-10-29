@@ -30,6 +30,16 @@ const ServoPanel: React.FC = () => {
     }
   };
 
+  // Get current PWM value for selected servo
+  const getCurrentPwm = (id: number): number | null => {
+    const key = `servo${id}_pwm` as keyof typeof servo;
+    const pwm = servo[key];
+    return typeof pwm === 'number' ? pwm : null;
+  };
+
+  const currentPwm = getCurrentPwm(servoId);
+  const hasTelemetry = servo.pwm_values && servo.pwm_values.length > 0;
+
   return (
     <div className="bg-[#111827] rounded-lg p-4 flex flex-col gap-4">
       <header className="flex items-center justify-between">
@@ -38,6 +48,23 @@ const ServoPanel: React.FC = () => {
           {servo.active ? 'Active' : 'Idle'}
         </span>
       </header>
+
+      {/* Live PWM Telemetry */}
+      {hasTelemetry && (
+        <div className="bg-[#1F2937] rounded-md p-3 border border-slate-700">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs uppercase text-slate-400 font-semibold">Live PWM Output</span>
+            <span className="text-xs text-green-400">● ACTIVE</span>
+          </div>
+          {currentPwm !== null && (
+            <div className="flex items-baseline gap-2">
+              <span className="text-2xl font-mono font-bold text-white">{currentPwm}</span>
+              <span className="text-sm text-slate-400">μs</span>
+              <span className="text-xs text-slate-500 ml-auto">Servo {servoId}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3 text-sm text-slate-200">
         <label className="flex flex-col gap-1">

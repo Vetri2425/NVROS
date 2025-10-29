@@ -1,20 +1,23 @@
 import React, { useState, useRef } from 'react';
 import { TrashIcon } from '../icons/TrashIcon';
 import { Waypoint } from '../../types';
+import { getNavigationCommands, getDoCommands, getConditionCommands, getCommandDefinition } from '../../utils/mavlink_commands';
 
-const COMMAND_OPTIONS = [
-  'WAYPOINT',
-  'SPLINE_WAYPOINT',
-  'LOITER_TIME',
-  'LOITER_TURNS',
-  'RETURN_TO_LAUNCH',
-  'LAND',
-  'TAKEOFF',
-  'CONDITION_DELAY',
-  'DO_CHANGE_SPEED',
-  'DO_SET_HOME',
-  'DO_SET_SERVO',
-];
+// Get all available commands organized by category
+const NAV_COMMANDS = getNavigationCommands();
+const DO_COMMANDS = getDoCommands();
+const CONDITION_COMMANDS = getConditionCommands();
+
+/**
+ * Get parameter label based on command type
+ */
+function getParamLabel(command: string, paramNum: 1 | 2 | 3 | 4): string {
+  const def = getCommandDefinition(command);
+  if (!def) return `Param${paramNum}`;
+  
+  const paramKey = `param${paramNum}` as keyof typeof def.params;
+  return def.params[paramKey] || `P${paramNum}`;
+}
 
 type QGCWaypointTableProps = {
   waypoints: Waypoint[];
@@ -127,20 +130,68 @@ const QGCWaypointTable: React.FC<QGCWaypointTableProps> = ({
                       <select
                         value={wp.command}
                         onChange={(e) => handleCommandChange(e, wp.id)}
-                        className="bg-gray-700 border-gray-600 rounded p-1 text-sm focus:outline-none focus:ring-1 focus:ring-green-500 w-full"
+                        className="bg-gray-700 border-gray-600 rounded p-1 text-xs focus:outline-none focus:ring-1 focus:ring-green-500 w-full"
                       >
-                        {!COMMAND_OPTIONS.includes(wp.command) && (
-                          <option value={wp.command}>{wp.command}</option>
-                        )}
-                        {COMMAND_OPTIONS.map(cmd => (
-                          <option key={cmd} value={cmd}>{cmd}</option>
-                        ))}
+                        {/* Navigation Commands */}
+                        <optgroup label="━━ Navigation ━━">
+                          {NAV_COMMANDS.map(cmd => (
+                            <option key={cmd.id} value={cmd.name}>{cmd.name}</option>
+                          ))}
+                        </optgroup>
+                        {/* DO Commands */}
+                        <optgroup label="━━ DO Commands ━━">
+                          {DO_COMMANDS.map(cmd => (
+                            <option key={cmd.id} value={cmd.name}>{cmd.name}</option>
+                          ))}
+                        </optgroup>
+                        {/* Condition Commands */}
+                        <optgroup label="━━ Conditions ━━">
+                          {CONDITION_COMMANDS.map(cmd => (
+                            <option key={cmd.id} value={cmd.name}>{cmd.name}</option>
+                          ))}
+                        </optgroup>
                       </select>
                     </td>
-                    <td className="px-2 py-1"><input type="number" value={wp.param1 || 0} onChange={(e) => handleValueChange(wp.id, 'param1', e.target.value)} className="bg-gray-700 w-20 p-1 rounded" /></td>
-                    <td className="px-2 py-1"><input type="number" value={wp.param2 || 0} onChange={(e) => handleValueChange(wp.id, 'param2', e.target.value)} className="bg-gray-700 w-20 p-1 rounded" /></td>
-                    <td className="px-2 py-1"><input type="number" value={wp.param3 || 0} onChange={(e) => handleValueChange(wp.id, 'param3', e.target.value)} className="bg-gray-700 w-20 p-1 rounded" /></td>
-                    <td className="px-2 py-1"><input type="number" value={wp.param4 || 0} onChange={(e) => handleValueChange(wp.id, 'param4', e.target.value)} className="bg-gray-700 w-20 p-1 rounded" /></td>
+                    <td className="px-2 py-1">
+                      <input 
+                        type="number" 
+                        value={wp.param1 || 0} 
+                        onChange={(e) => handleValueChange(wp.id, 'param1', e.target.value)} 
+                        className="bg-gray-700 w-20 p-1 rounded text-xs" 
+                        title={getParamLabel(wp.command, 1)}
+                        placeholder={getParamLabel(wp.command, 1)}
+                      />
+                    </td>
+                    <td className="px-2 py-1">
+                      <input 
+                        type="number" 
+                        value={wp.param2 || 0} 
+                        onChange={(e) => handleValueChange(wp.id, 'param2', e.target.value)} 
+                        className="bg-gray-700 w-20 p-1 rounded text-xs" 
+                        title={getParamLabel(wp.command, 2)}
+                        placeholder={getParamLabel(wp.command, 2)}
+                      />
+                    </td>
+                    <td className="px-2 py-1">
+                      <input 
+                        type="number" 
+                        value={wp.param3 || 0} 
+                        onChange={(e) => handleValueChange(wp.id, 'param3', e.target.value)} 
+                        className="bg-gray-700 w-20 p-1 rounded text-xs" 
+                        title={getParamLabel(wp.command, 3)}
+                        placeholder={getParamLabel(wp.command, 3)}
+                      />
+                    </td>
+                    <td className="px-2 py-1">
+                      <input 
+                        type="number" 
+                        value={wp.param4 || 0} 
+                        onChange={(e) => handleValueChange(wp.id, 'param4', e.target.value)} 
+                        className="bg-gray-700 w-20 p-1 rounded text-xs" 
+                        title={getParamLabel(wp.command, 4)}
+                        placeholder={getParamLabel(wp.command, 4)}
+                      />
+                    </td>
                     <td className="px-2 py-1 font-mono"><input type="number" step="0.000001" value={wp.lat} onChange={(e) => handleValueChange(wp.id, 'lat', e.target.value)} className="bg-gray-700 w-28 p-1 rounded" /></td>
                     <td className="px-2 py-1 font-mono"><input type="number" step="0.000001" value={wp.lng} onChange={(e) => handleValueChange(wp.id, 'lng', e.target.value)} className="bg-gray-700 w-28 p-1 rounded" /></td>
                     <td className="px-2 py-1"><input type="number" value={wp.alt} onChange={(e) => handleValueChange(wp.id, 'alt', e.target.value)} className="bg-gray-700 w-20 p-1 rounded" /></td>

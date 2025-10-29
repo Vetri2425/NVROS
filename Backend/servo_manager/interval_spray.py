@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 interval_spray.py
-Connects to MAVLink (udp:127.0.0.1:14550) and toggles a servo ON/OFF at either
-time-based or distance-based intervals while the mission runs. Optionally, the
-spray window can be limited between a start and end waypoint.
+Connects to ROS 2/MAVROS and toggles a servo ON/OFF at either time-based or
+distance-based intervals while the mission runs. Optionally, the spray window
+can be limited between a start and end waypoint.
 
 Configuration (Backend/servo_manager/config.json → interval_spray):
   - servo_number (int, default 10)
@@ -17,7 +17,7 @@ Configuration (Backend/servo_manager/config.json → interval_spray):
   - end_wp (int, optional; default -1 → run until stopped)
 
 Behavior:
-  - If start_wp >= 0: wait until MISSION_ITEM_REACHED for that wp (tolerate 0- or 1-based)
+  - If start_wp >= 0: wait until waypoint reached for that wp (tolerate 0- or 1-based)
   - If end_wp >= 0: stop spraying after that wp is reached (ensure OFF)
   - Timer mode: alternate ON/OFF every on_time_s/off_time_s while active
   - Distance mode: toggle ON/OFF every distance_interval_m traveled while active,
@@ -32,13 +32,19 @@ import sys
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from pymavlink import mavutil
+# Import ROS servo controller
+from ros_servo import ServoController
 
 BASE = os.path.dirname(__file__)
 CFG = os.path.join(BASE, "config.json")
-CONNECTION_STRING = os.environ.get("INTERVAL_CONNECTION", "udp:127.0.0.1:14550")
 
 running = True
+active = False  # spraying window active (between start/end)
+servo_state_on = False
+last_toggle_time = time.monotonic()
+acc_dist = 0.0
+last_pos: Optional[Tuple[float, float]] = None
+last_seq = -1
 
 
 def _sigterm(_sig, _frm):
@@ -73,31 +79,6 @@ def get_params() -> Dict[str, Any]:
     }
 
 
-def wait_heartbeat(master: mavutil.mavfile):
-    print("[interval_spray] Waiting for heartbeat...", flush=True)
-    master.wait_heartbeat(timeout=10)
-    print(
-        f"[interval_spray] Heartbeat received from system {master.target_system} component {master.target_component}",
-        flush=True,
-    )
-
-
-def send_do_set_servo(master: mavutil.mavfile, servo_no: int, pwm: int):
-    try:
-        master.mav.command_long_send(
-            master.target_system,
-            master.target_component,
-            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-            0,
-            float(servo_no),
-            float(pwm),
-            0, 0, 0, 0, 0,
-        )
-        print(f"[interval_spray] DO_SET_SERVO ch={servo_no} pwm={pwm}", flush=True)
-    except Exception as e:
-        print(f"[interval_spray] ERROR sending DO_SET_SERVO: {e}", flush=True)
-
-
 def _matches_seq(reached_seq: int, wp_config: int) -> bool:
     return reached_seq == wp_config or reached_seq == wp_config - 1
 
@@ -110,33 +91,203 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * R * math.asin(min(1.0, math.sqrt(a)))
 
 
-def _extract_latlon(msg) -> Optional[Tuple[float, float]]:
+def waypoint_callback(msg):
+    """Callback for waypoint reached messages."""
+    global active, servo_state_on, last_seq, last_toggle_time, acc_dist, last_pos, running
+    
+    if not running:
+        return
+    
     try:
-        if msg.get_type() == "GLOBAL_POSITION_INT":
-            lat = getattr(msg, "lat", None)
-            lon = getattr(msg, "lon", None)
-            if lat is not None and lon is not None:
-                return float(lat) / 1e7, float(lon) / 1e7
-        if msg.get_type() == "GPS_RAW_INT":
-            lat = getattr(msg, "lat", None)
-            lon = getattr(msg, "lon", None)
-            if lat is not None and lon is not None and lat != 0 and lon != 0:
-                return float(lat) / 1e7, float(lon) / 1e7
+        seq = int(msg.wp_seq)
     except Exception:
-        pass
-    return None
+        seq = -1
+    
+    if seq >= 0 and seq != last_seq:
+        last_seq = seq
+        params = get_params()
+        controller = getattr(waypoint_callback, 'controller', None)
+        
+        if not active and params["start_wp"] >= 0 and _matches_seq(seq, params["start_wp"]):
+            print(f"[interval_spray] Start window @seq={seq}", flush=True)
+            active = True
+            # reset timers/counters at window start
+            last_toggle_time = time.monotonic()
+            acc_dist = 0.0
+            last_pos = None
+            servo_state_on = False
+        
+        if active and params["end_wp"] >= 0 and _matches_seq(seq, params["end_wp"]):
+            print(f"[interval_spray] End window @seq={seq}", flush=True)
+            if servo_state_on and controller:
+                controller.set_servo(params["servo_number"], params["pwm_off"])
+                servo_state_on = False
+            active = False
+
+
+def position_callback(msg):
+    """Callback for position updates (for distance mode)."""
+    global active, servo_state_on, acc_dist, last_pos, running
+    
+    if not running or not active:
+        return
+    
+    params = get_params()
+    if params["toggle_mode"] != "distance":
+        return
+    
+    controller = getattr(position_callback, 'controller', None)
+    if not controller:
+        return
+    
+    try:
+        lat = msg.latitude
+        lon = msg.longitude
+        
+        if lat == 0.0 and lon == 0.0:
+            return
+        
+        if last_pos is not None:
+            acc_dist += _haversine_m(last_pos[0], last_pos[1], lat, lon)
+        last_pos = (lat, lon)
+        
+        if acc_dist >= params["distance_interval_m"]:
+            # toggle
+            if servo_state_on:
+                controller.set_servo(params["servo_number"], params["pwm_off"])
+                servo_state_on = False
+            else:
+                controller.set_servo(params["servo_number"], params["pwm_on"])
+                servo_state_on = True
+            acc_dist = 0.0
+    except Exception as e:
+        print(f"[interval_spray] Position callback error: {e}", flush=True)
+
+
+def timer_check(controller, params):
+    """Check and toggle servo based on time (for timer mode)."""
+    global active, servo_state_on, last_toggle_time
+    
+    if not active or params["toggle_mode"] != "timer":
+        return
+    
+    now = time.monotonic()
+    if servo_state_on and now - last_toggle_time >= params["on_time_s"]:
+        controller.set_servo(params["servo_number"], params["pwm_off"])
+        servo_state_on = False
+        last_toggle_time = now
+    elif not servo_state_on and now - last_toggle_time >= params["off_time_s"]:
+        controller.set_servo(params["servo_number"], params["pwm_on"])
+        servo_state_on = True
+        last_toggle_time = now
 
 
 def main():
-    global running
+    global running, active, servo_state_on
+    
     params = get_params()
-    print(f"[interval_spray] Starting with params: {params}", flush=True)
+    print(f"[interval_spray] Starting ROS mode with params: {params}", flush=True)
+    
+    if params["start_wp"] < 0:
+        active = True
+    
+    try:
+        import rclpy
+        from mavros_msgs.msg import WaypointReached
+        from sensor_msgs.msg import NavSatFix
+        
+        if not rclpy.ok():
+            rclpy.init()
+        
+        # Create servo controller
+        controller = ServoController(use_ros=True)
+        
+        # Store controller in callback functions
+        waypoint_callback.controller = controller
+        position_callback.controller = controller
+        
+        # Subscribe to waypoint reached topic
+        print("[interval_spray] Subscribing to /mavros/mission/reached...", flush=True)
+        wp_subscription = controller.node.create_subscription(
+            WaypointReached,
+            '/mavros/mission/reached',
+            waypoint_callback,
+            10
+        )
+        
+        # Subscribe to position topic for distance mode
+        print("[interval_spray] Subscribing to /mavros/global_position/global...", flush=True)
+        pos_subscription = controller.node.create_subscription(
+            NavSatFix,
+            '/mavros/global_position/global',
+            position_callback,
+            10
+        )
+        
+        print(f"[interval_spray] Listening for events (mode={params['toggle_mode']})...", flush=True)
+        
+        # Spin in loop
+        while running and rclpy.ok():
+            rclpy.spin_once(controller.node, timeout_sec=0.1)
+            # Check timer mode toggling
+            timer_check(controller, params)
+            
+            # Check if we're done (both start and end reached)
+            if not active and params["start_wp"] >= 0 and params["end_wp"] >= 0 and last_seq >= 0:
+                break
+        
+        # Ensure OFF on exit
+        if servo_state_on:
+            controller.set_servo(params["servo_number"], params["pwm_off"])
+        
+        print("[interval_spray] Shutting down...", flush=True)
+        controller.shutdown()
+        
+    except ImportError as e:
+        print(f"[interval_spray] ROS 2 not available: {e}", flush=True)
+        print("[interval_spray] Falling back to MAVLink mode...", flush=True)
+        main_mavlink()
+    except Exception as e:
+        print(f"[interval_spray] ERROR: {e}", flush=True)
+        raise
+
+
+def main_mavlink():
+    """Fallback to MAVLink if ROS is not available."""
+    global running, active, servo_state_on, last_seq, last_toggle_time, acc_dist, last_pos
+    
+    from pymavlink import mavutil
+    
+    CONNECTION_STRING = os.environ.get("INTERVAL_CONNECTION", "udp:127.0.0.1:14550")
+    
+    def _extract_latlon(msg) -> Optional[Tuple[float, float]]:
+        try:
+            if msg.get_type() == "GLOBAL_POSITION_INT":
+                lat = getattr(msg, "lat", None)
+                lon = getattr(msg, "lon", None)
+                if lat is not None and lon is not None:
+                    return float(lat) / 1e7, float(lon) / 1e7
+            if msg.get_type() == "GPS_RAW_INT":
+                lat = getattr(msg, "lat", None)
+                lon = getattr(msg, "lon", None)
+                if lat is not None and lon is not None and lat != 0 and lon != 0:
+                    return float(lat) / 1e7, float(lon) / 1e7
+        except Exception:
+            pass
+        return None
+    
+    params = get_params()
+    print(f"[interval_spray] Starting MAVLink mode with params: {params}", flush=True)
 
     master = None
     while running and master is None:
         try:
             master = mavutil.mavlink_connection(CONNECTION_STRING)
-            wait_heartbeat(master)
+            master.wait_heartbeat(timeout=10)
+            print(
+                f"[interval_spray] Heartbeat received from system {master.target_system} component {master.target_component}",
+                flush=True,
+            )
         except Exception as e:
             print(f"[interval_spray] Connection failed: {e} (retrying in 2s)", flush=True)
             master = None
@@ -146,15 +297,15 @@ def main():
         print("[interval_spray] Exiting (not running or no connection)", flush=True)
         return
 
-    active = False  # spraying window active (between start/end)
+    active_local = False  # spraying window active (between start/end)
     if params["start_wp"] < 0:
-        active = True
+        active_local = True
 
-    last_seq = -1
-    servo_state_on = False
-    last_toggle_time = time.monotonic()
-    acc_dist = 0.0
-    last_pos = None  # (lat, lon)
+    last_seq_local = -1
+    servo_state_on_local = False
+    last_toggle_time_local = time.monotonic()
+    acc_dist_local = 0.0
+    last_pos_local = None  # (lat, lon)
 
     print("[interval_spray] Listening for position and mission events...", flush=True)
 
@@ -168,16 +319,34 @@ def main():
 
         if msg is None:
             # Still process time-based toggling even if no messages arrive
-            if active and params["toggle_mode"] == "timer":
+            if active_local and params["toggle_mode"] == "timer":
                 now = time.monotonic()
-                if servo_state_on and now - last_toggle_time >= params["on_time_s"]:
-                    send_do_set_servo(master, params["servo_number"], params["pwm_off"])
-                    servo_state_on = False
-                    last_toggle_time = now
-                elif not servo_state_on and now - last_toggle_time >= params["off_time_s"]:
-                    send_do_set_servo(master, params["servo_number"], params["pwm_on"])
-                    servo_state_on = True
-                    last_toggle_time = now
+                if servo_state_on_local and now - last_toggle_time_local >= params["on_time_s"]:
+                    master.mav.command_long_send(
+                        master.target_system,
+                        master.target_component,
+                        183,  # MAV_CMD_DO_SET_SERVO
+                        0,
+                        float(params["servo_number"]),
+                        float(params["pwm_off"]),
+                        0, 0, 0, 0, 0,
+                    )
+                    print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_off']}", flush=True)
+                    servo_state_on_local = False
+                    last_toggle_time_local = now
+                elif not servo_state_on_local and now - last_toggle_time_local >= params["off_time_s"]:
+                    master.mav.command_long_send(
+                        master.target_system,
+                        master.target_component,
+                        183,  # MAV_CMD_DO_SET_SERVO
+                        0,
+                        float(params["servo_number"]),
+                        float(params["pwm_on"]),
+                        0, 0, 0, 0, 0,
+                    )
+                    print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_on']}", flush=True)
+                    servo_state_on_local = True
+                    last_toggle_time_local = now
             continue
 
         mtype = msg.get_type()
@@ -188,59 +357,113 @@ def main():
                 seq = int(getattr(msg, "seq", -1))
             except Exception:
                 seq = -1
-            if seq >= 0 and seq != last_seq:
-                last_seq = seq
-                if not active and params["start_wp"] >= 0 and _matches_seq(seq, params["start_wp"]):
+            if seq >= 0 and seq != last_seq_local:
+                last_seq_local = seq
+                if not active_local and params["start_wp"] >= 0 and _matches_seq(seq, params["start_wp"]):
                     print(f"[interval_spray] Start window @seq={seq}", flush=True)
-                    active = True
+                    active_local = True
                     # reset timers/counters at window start
-                    last_toggle_time = time.monotonic()
-                    acc_dist = 0.0
-                    last_pos = None
-                    servo_state_on = False
-                if active and params["end_wp"] >= 0 and _matches_seq(seq, params["end_wp"]):
+                    last_toggle_time_local = time.monotonic()
+                    acc_dist_local = 0.0
+                    last_pos_local = None
+                    servo_state_on_local = False
+                if active_local and params["end_wp"] >= 0 and _matches_seq(seq, params["end_wp"]):
                     print(f"[interval_spray] End window @seq={seq}", flush=True)
-                    if servo_state_on:
-                        send_do_set_servo(master, params["servo_number"], params["pwm_off"])
-                        servo_state_on = False
-                    active = False
+                    if servo_state_on_local:
+                        master.mav.command_long_send(
+                            master.target_system,
+                            master.target_component,
+                            183,  # MAV_CMD_DO_SET_SERVO
+                            0,
+                            float(params["servo_number"]),
+                            float(params["pwm_off"]),
+                            0, 0, 0, 0, 0,
+                        )
+                        print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_off']}", flush=True)
+                        servo_state_on_local = False
+                    active_local = False
                     # If both start and end are defined and reached, we can exit
                     if params["start_wp"] >= 0:
                         break
             continue
 
         # Position updates for distance toggling
-        if active and params["toggle_mode"] == "distance":
+        if active_local and params["toggle_mode"] == "distance":
             latlon = _extract_latlon(msg)
             if latlon is not None:
-                if last_pos is not None:
-                    acc_dist += _haversine_m(last_pos[0], last_pos[1], latlon[0], latlon[1])
-                last_pos = latlon
-                if acc_dist >= params["distance_interval_m"]:
+                if last_pos_local is not None:
+                    acc_dist_local += _haversine_m(last_pos_local[0], last_pos_local[1], latlon[0], latlon[1])
+                last_pos_local = latlon
+                if acc_dist_local >= params["distance_interval_m"]:
                     # toggle
-                    if servo_state_on:
-                        send_do_set_servo(master, params["servo_number"], params["pwm_off"])
-                        servo_state_on = False
+                    if servo_state_on_local:
+                        master.mav.command_long_send(
+                            master.target_system,
+                            master.target_component,
+                            183,  # MAV_CMD_DO_SET_SERVO
+                            0,
+                            float(params["servo_number"]),
+                            float(params["pwm_off"]),
+                            0, 0, 0, 0, 0,
+                        )
+                        print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_off']}", flush=True)
+                        servo_state_on_local = False
                     else:
-                        send_do_set_servo(master, params["servo_number"], params["pwm_on"])
-                        servo_state_on = True
-                    acc_dist = 0.0
+                        master.mav.command_long_send(
+                            master.target_system,
+                            master.target_component,
+                            183,  # MAV_CMD_DO_SET_SERVO
+                            0,
+                            float(params["servo_number"]),
+                            float(params["pwm_on"]),
+                            0, 0, 0, 0, 0,
+                        )
+                        print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_on']}", flush=True)
+                        servo_state_on_local = True
+                    acc_dist_local = 0.0
 
         # Timer toggling handled also when messages are present
-        if active and params["toggle_mode"] == "timer":
+        if active_local and params["toggle_mode"] == "timer":
             now = time.monotonic()
-            if servo_state_on and now - last_toggle_time >= params["on_time_s"]:
-                send_do_set_servo(master, params["servo_number"], params["pwm_off"])
-                servo_state_on = False
-                last_toggle_time = now
-            elif not servo_state_on and now - last_toggle_time >= params["off_time_s"]:
-                send_do_set_servo(master, params["servo_number"], params["pwm_on"])
-                servo_state_on = True
-                last_toggle_time = now
+            if servo_state_on_local and now - last_toggle_time_local >= params["on_time_s"]:
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    183,  # MAV_CMD_DO_SET_SERVO
+                    0,
+                    float(params["servo_number"]),
+                    float(params["pwm_off"]),
+                    0, 0, 0, 0, 0,
+                )
+                print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_off']}", flush=True)
+                servo_state_on_local = False
+                last_toggle_time_local = now
+            elif not servo_state_on_local and now - last_toggle_time_local >= params["off_time_s"]:
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    183,  # MAV_CMD_DO_SET_SERVO
+                    0,
+                    float(params["servo_number"]),
+                    float(params["pwm_on"]),
+                    0, 0, 0, 0, 0,
+                )
+                print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_on']}", flush=True)
+                servo_state_on_local = True
+                last_toggle_time_local = now
 
     # Ensure OFF on exit
-    if master and servo_state_on:
-        send_do_set_servo(master, params["servo_number"], params["pwm_off"])
+    if master and servo_state_on_local:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            183,  # MAV_CMD_DO_SET_SERVO
+            0,
+            float(params["servo_number"]),
+            float(params["pwm_off"]),
+            0, 0, 0, 0, 0,
+        )
+        print(f"[interval_spray] DO_SET_SERVO ch={params['servo_number']} pwm={params['pwm_off']}", flush=True)
     print("[interval_spray] Exiting", flush=True)
 
 

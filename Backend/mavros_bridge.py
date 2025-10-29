@@ -66,6 +66,7 @@ class MavrosBridge:
         self._battery_topic: Optional[roslibpy.Topic] = None
         self._mission_topic: Optional[roslibpy.Topic] = None
         self._mission_reached_topic: Optional[roslibpy.Topic] = None
+        self._rc_out_topic: Optional[roslibpy.Topic] = None
 
         self._rtcm_topic: Optional[roslibpy.Topic] = None
         self._setpoint_topic: Optional[roslibpy.Topic] = None
@@ -202,6 +203,82 @@ class MavrosBridge:
         service = roslibpy.Service(self._ros, "/mavros/mission/clear", "mavros_msgs/WaypointClear")
         return self._call_service(service, roslibpy.ServiceRequest({}), timeout)
 
+    def set_current_waypoint(self, wp_seq: int, timeout: float = 5.0) -> Dict[str, Any]:
+        """
+        Set the current mission waypoint (skip to specific waypoint).
+        
+        Args:
+            wp_seq: Waypoint sequence number to jump to (0-based)
+            timeout: Service call timeout
+            
+        Returns:
+            Dict with 'success' (bool) field
+        """
+        service = roslibpy.Service(self._ros, "/mavros/mission/set_current", "mavros_msgs/WaypointSetCurrent")
+        request = roslibpy.ServiceRequest({"wp_seq": int(wp_seq)})
+        response = self._call_service(service, request, timeout)
+        if not response.get("success", False):
+            raise ServiceError(f"Failed to set current waypoint to {wp_seq}: {response}")
+        return response
+
+    def send_command_long(
+        self,
+        command: int,
+        param1: float = 0.0,
+        param2: float = 0.0,
+        param3: float = 0.0,
+        param4: float = 0.0,
+        param5: float = 0.0,
+        param6: float = 0.0,
+        param7: float = 0.0,
+        timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """
+        Send a MAVLink COMMAND_LONG via MAVROS.
+        
+        Args:
+            command: MAV_CMD command ID (e.g., 183 for DO_SET_SERVO)
+            param1-7: Command parameters
+            timeout: Service call timeout
+            
+        Returns:
+            Dict with 'success' (bool) and 'result' (int) fields
+        """
+        service = roslibpy.Service(self._ros, "/mavros/cmd/command", "mavros_msgs/CommandLong")
+        request = roslibpy.ServiceRequest({
+            "broadcast": False,
+            "command": int(command),
+            "confirmation": 0,
+            "param1": float(param1),
+            "param2": float(param2),
+            "param3": float(param3),
+            "param4": float(param4),
+            "param5": float(param5),
+            "param6": float(param6),
+            "param7": float(param7)
+        })
+        return self._call_service(service, request, timeout)
+
+    def set_servo(self, servo_number: int, pwm_value: int, timeout: float = 5.0) -> Dict[str, Any]:
+        """
+        Set a servo to a specific PWM value using MAV_CMD_DO_SET_SERVO (183).
+        
+        Args:
+            servo_number: Servo/channel number (typically 1-16)
+            pwm_value: PWM value in microseconds (typically 1000-2000)
+            timeout: Service call timeout
+            
+        Returns:
+            Dict with 'success' (bool) and 'result' (int) fields
+        """
+        MAV_CMD_DO_SET_SERVO = 183
+        return self.send_command_long(
+            command=MAV_CMD_DO_SET_SERVO,
+            param1=float(servo_number),
+            param2=float(pwm_value),
+            timeout=timeout
+        )
+
     def send_rtcm(self, payload: bytes) -> None:
         if not payload:
             return
@@ -293,6 +370,9 @@ class MavrosBridge:
         # Mission tracking
         self._mission_topic = roslibpy.Topic(self._ros, "/mavros/mission/waypoints", "mavros_msgs/WaypointList")
         self._mission_reached_topic = roslibpy.Topic(self._ros, "/mavros/mission/reached", "mavros_msgs/WaypointReached")
+        
+        # Servo output (PWM values)
+        self._rc_out_topic = roslibpy.Topic(self._ros, "/mavros/rc/out", "mavros_msgs/RCOut")
 
         # Subscribe to all topics
         self._state_topic.subscribe(self._handle_state)
@@ -306,6 +386,7 @@ class MavrosBridge:
         self._signal_topic.subscribe(self._handle_signal)
         self._mission_topic.subscribe(self._handle_waypoint_list)
         self._mission_reached_topic.subscribe(self._handle_waypoint_reached)
+        self._rc_out_topic.subscribe(self._handle_servo_output)
 
     # ------------------------------- topic handlers
 
@@ -439,3 +520,23 @@ class MavrosBridge:
             },
             "wp_seq": wp_seq
         }, message_type="mission_reached")
+
+    def _handle_servo_output(self, message: Dict[str, Any]) -> None:
+        """Handle servo output (PWM) updates from /mavros/rc/out."""
+        channels = message.get("channels", [])
+        
+        # Build servo state with PWM values for each channel
+        # Channels are 0-indexed, so servo 1 is channels[0], etc.
+        servo_state = {
+            "channels": channels,
+            "count": len(channels)
+        }
+        
+        # Add individual servo PWM values (up to 16 servos)
+        for i, pwm in enumerate(channels[:16], start=1):
+            servo_state[f"servo{i}_pwm"] = int(pwm)
+        
+        self._broadcast_telem({
+            "servo_output": servo_state
+        }, message_type="servo_output")
+

@@ -36,6 +36,23 @@ export interface ServoStatus {
   servo_id: number;
   active: boolean;
   last_command_ts: number;
+  pwm_values?: number[]; // Live PWM values from /mavros/rc/out
+  servo1_pwm?: number;
+  servo2_pwm?: number;
+  servo3_pwm?: number;
+  servo4_pwm?: number;
+  servo5_pwm?: number;
+  servo6_pwm?: number;
+  servo7_pwm?: number;
+  servo8_pwm?: number;
+  servo9_pwm?: number;
+  servo10_pwm?: number;
+  servo11_pwm?: number;
+  servo12_pwm?: number;
+  servo13_pwm?: number;
+  servo14_pwm?: number;
+  servo15_pwm?: number;
+  servo16_pwm?: number;
 }
 
 export interface TelemetryEnvelope {
