@@ -26,6 +26,8 @@ type QGCWaypointTableProps = {
   activeWaypointIndex: number | null;
   selectedWaypointIds: number[];
   onWaypointSelectionChange: (id: number, isSelected: boolean) => void;
+  onDeleteSelected?: () => void;
+  onSelectAll?: () => void;
 };
 
 const QGCWaypointTable: React.FC<QGCWaypointTableProps> = ({ 
@@ -34,7 +36,9 @@ const QGCWaypointTable: React.FC<QGCWaypointTableProps> = ({
     onUpdate, 
     activeWaypointIndex,
     selectedWaypointIds,
-    onWaypointSelectionChange
+    onWaypointSelectionChange,
+    onDeleteSelected,
+    onSelectAll
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const dragStartId = useRef<number | null>(null);
@@ -90,7 +94,30 @@ const QGCWaypointTable: React.FC<QGCWaypointTableProps> = ({
 
   return (
     <div className="bg-[#111827] h-full rounded-md p-3 flex flex-col text-sm text-gray-300 overflow-hidden" onMouseUp={handleMouseUp}>
-      <h2 className="text-lg font-bold mb-2">Mission Plan (QGC WPL 110)</h2>
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-lg font-bold">Mission Plan (QGC WPL 110)</h2>
+        <div className="flex gap-2">
+          {onSelectAll && (
+            <button
+              onClick={onSelectAll}
+              className="px-3 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors"
+              title="Select all waypoints"
+            >
+              Select All
+            </button>
+          )}
+          {onDeleteSelected && selectedWaypointIds.length > 0 && (
+            <button
+              onClick={onDeleteSelected}
+              className="px-3 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition-colors flex items-center gap-1"
+              title={`Delete ${selectedWaypointIds.length} selected waypoint(s)`}
+            >
+              <TrashIcon className="w-4 h-4" />
+              Delete Selected ({selectedWaypointIds.length})
+            </button>
+          )}
+        </div>
+      </div>
       <div className="flex-1 overflow-y-auto">
         <table className="w-full text-left">
           <thead className="sticky top-0 bg-[#111827]">

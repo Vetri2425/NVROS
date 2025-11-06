@@ -45,17 +45,31 @@ const MAP_COMMANDS = new Set<string>([
   'LOITER_TURNS',
 ]);
 
-// Temporary raster/SVG rover icon used for quick swapping without touching
-// the existing `RoverIcon` React component. This is a compact top-down car
-// SVG encoded as markup so it can be injected into a Leaflet `divIcon`.
+// Top-down rover icon (bird's eye view) with clear front direction
 const ROVER_SVG = `
-<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" width="32" height="32" style="display:block">
-  <rect x="6" y="14" width="52" height="36" rx="6" ry="6" fill="#e11d1d" stroke="#8b0000" stroke-width="1" />
-  <rect x="12" y="20" width="40" height="16" rx="2" ry="2" fill="#111" opacity="0.9" />
-  <rect x="14" y="38" width="10" height="6" fill="#111" />
-  <rect x="40" y="38" width="10" height="6" fill="#111" />
-  <rect x="20" y="18" width="8" height="6" fill="#fff" opacity="0.15" />
-  <rect x="36" y="18" width="8" height="6" fill="#fff" opacity="0.15" />
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" width="200" height="200" style="display:block">
+  <!-- Main body -->
+  <rect x="18" y="10" width="28" height="44" rx="4" ry="4" fill="#2563eb" stroke="#1e40af" stroke-width="2" />
+  
+  <!-- Front windshield (top = front) -->
+  <path d="M 20 14 L 32 18 L 44 14 L 44 22 L 20 22 Z" fill="#93c5fd" opacity="0.7" />
+  
+  <!-- Headlights -->
+  <circle cx="24" cy="12" r="2" fill="#fef08a" />
+  <circle cx="40" cy="12" r="2" fill="#fef08a" />
+  
+  <!-- Side mirrors -->
+  <rect x="14" y="22" width="4" height="8" rx="1" fill="#1e40af" />
+  <rect x="46" y="22" width="4" height="8" rx="1" fill="#1e40af" />
+  
+  <!-- Wheels -->
+  <rect x="14" y="18" width="5" height="10" rx="2" fill="#1f2937" stroke="#000" stroke-width="1" />
+  <rect x="45" y="18" width="5" height="10" rx="2" fill="#1f2937" stroke="#000" stroke-width="1" />
+  <rect x="14" y="36" width="5" height="10" rx="2" fill="#1f2937" stroke="#000" stroke-width="1" />
+  <rect x="45" y="36" width="5" height="10" rx="2" fill="#1f2937" stroke="#000" stroke-width="1" />
+  
+  <!-- Rear window -->
+  <rect x="22" y="48" width="20" height="4" rx="1" fill="#93c5fd" opacity="0.5" />
 </svg>
 `;
 
@@ -86,6 +100,14 @@ const getWaypointIcon = (waypoint: Waypoint, index: number, total: number, activ
     });
 };
 
+// Helper: Calculate endpoint of a line given start point, bearing (degrees), and distance (in degrees)
+const calculateEndPoint = (lat: number, lng: number, bearing: number, distance: number) => {
+  const bearingRad = (bearing * Math.PI) / 180;
+  const endLat = lat + distance * Math.cos(bearingRad);
+  const endLng = lng + distance * Math.sin(bearingRad) / Math.cos((lat * Math.PI) / 180);
+  return { lat: endLat, lng: endLng };
+};
+
 const MapView: React.FC<MapViewProps> = ({
   missionWaypoints,
   onMapClick,
@@ -97,15 +119,16 @@ const MapView: React.FC<MapViewProps> = ({
   onNewMissionDrawn,
   isConnectedToRover,
   onUpdateWaypointPosition,
-}) => {
+  }) => {
   const pathWaypoints = useMemo(
     () =>
-      missionWaypoints.filter(
-        (wp) =>
-          MAP_COMMANDS.has(wp.command) &&
-          Number.isFinite(wp.lat) &&
-          Number.isFinite(wp.lng)
-      ),
+      {
+        return missionWaypoints.filter(
+          (wp) => MAP_COMMANDS.has(wp.command) &&
+            Number.isFinite(wp.lat) &&
+            Number.isFinite(wp.lng)
+        );
+      },
     [missionWaypoints]
   );
 
@@ -117,9 +140,13 @@ const MapView: React.FC<MapViewProps> = ({
   const missionMarkersRef = useRef<any[]>([]);
   const roverMarkerRef = useRef<any>(null);
   const traveledPathLayerRef = useRef<any>(null);
+  const pathSegmentsRef = useRef<Array<{ polyline: any, timestamp: number, points: any[] }>>([]);
   const headingLineRef = useRef<any>(null);
+  const northLineRef = useRef<any>(null);  // Static north reference line
+  const roverHeadingLineRef = useRef<any>(null);  // Dynamic rover heading line
   const drawingLayerRef = useRef<any>(null);
   const isDrawingRef = useRef(false);
+  const lastSmoothedHeadingRef = useRef<number>(0);  // For smooth heading transitions
 
   // Keep previous and last rover samples for interpolation
   const prevSampleRef = useRef<{ t: number, lat: number, lng: number, heading: number } | null>(null);
@@ -139,6 +166,19 @@ const MapView: React.FC<MapViewProps> = ({
   const [drawnPoints, setDrawnPoints] = useState<any[]>([]);
   const [mousePos, setMousePos] = useState<any>(null);
   const [measurementText, setMeasurementText] = useState<string | null>(null);
+
+  // Debug: Log when roverPosition changes
+  useEffect(() => {
+    if (roverPosition) {
+      console.log('[MapView] Rover position updated:', {
+        lat: roverPosition.lat,
+        lng: roverPosition.lng,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      console.log('[MapView] No rover position available');
+    }
+  }, [roverPosition]);
 
   const invalidateAndFitBounds = useCallback(() => {
     if (!mapRef.current) return;
@@ -333,8 +373,15 @@ const MapView: React.FC<MapViewProps> = ({
     missionMarkersRef.current = [];
     if (traveledPathLayerRef.current) traveledPathLayerRef.current.remove();
     traveledPathLayerRef.current = null;
+    // Clean up all path segments
+    pathSegmentsRef.current.forEach(segment => segment.polyline.remove());
+    pathSegmentsRef.current = [];
     if (headingLineRef.current) headingLineRef.current.remove();
     headingLineRef.current = null;
+    if (northLineRef.current) northLineRef.current.remove();
+    northLineRef.current = null;
+    if (roverHeadingLineRef.current) roverHeadingLineRef.current.remove();
+    roverHeadingLineRef.current = null;
 
     if (pathWaypoints.length > 0) {
       const latLngs = pathWaypoints.map((wp) => [wp.lat, wp.lng]);
@@ -381,25 +428,89 @@ const MapView: React.FC<MapViewProps> = ({
   useEffect(() => {
     if (!mapRef.current) return;
   if (roverPosition) {
-    // Use the temporary inline SVG as the marker content and rotate via a
-    // wrapping div. This keeps behavior similar to the previous SVG React
-    // component but makes swapping the image trivial.
-    const angle = heading || 0;
-    const roverIconHTML = `<div style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;transform:rotate(${angle}deg);">${ROVER_SVG}</div>`;
-    const roverIcon = L.divIcon({ html: roverIconHTML, className: 'bg-transparent border-0', iconSize: [32, 32], iconAnchor: [16, 16] });
+    // Smooth heading to prevent oscillation/jitter
+    const rawHeading = heading || 0;
+    const lastHeading = lastSmoothedHeadingRef.current;
+    
+    // Apply exponential smoothing (alpha = 0.15 for very smooth transitions)
+    let headingDiff = ((rawHeading - lastHeading + 540) % 360 - 180);
+    
+    // Only update if change is significant (> 2 degrees) to avoid jitter
+    if (Math.abs(headingDiff) < 2) {
+      headingDiff = 0;
+    }
+    
+    let smoothedHeading = lastHeading + 0.15 * headingDiff;
+    smoothedHeading = (smoothedHeading + 360) % 360;
+    lastSmoothedHeadingRef.current = smoothedHeading;
+    
+    // Top-down car icon with smoothed rotation - use transform with will-change for GPU acceleration
+    const roverIconHTML = `<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;transform:rotate(${smoothedHeading}deg);will-change:transform;transition:transform 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);">${ROVER_SVG}</div>`;
+    const roverIcon = L.divIcon({ 
+      html: roverIconHTML, 
+      className: 'bg-transparent border-0', 
+      iconSize: [200, 200], 
+      iconAnchor: [100, 100] 
+    });
+    
         if (!roverMarkerRef.current) {
             roverMarkerRef.current = L.marker([roverPosition.lat, roverPosition.lng], { icon: roverIcon, zIndexOffset: 1000 }).addTo(mapRef.current);
         } else {
-            roverMarkerRef.current.setLatLng([roverPosition.lat, roverPosition.lng]);
-      roverMarkerRef.current.setIcon(roverIcon);
+            // Only update position, not icon (to prevent size oscillation)
+            const currentPos = roverMarkerRef.current.getLatLng();
+            if (Math.abs(currentPos.lat - roverPosition.lat) > 0.0000001 || 
+                Math.abs(currentPos.lng - roverPosition.lng) > 0.0000001) {
+                roverMarkerRef.current.setLatLng([roverPosition.lat, roverPosition.lng]);
+            }
+            
+            // Update icon only if heading changed significantly
+            if (Math.abs(headingDiff) > 0.1) {
+                roverMarkerRef.current.setIcon(roverIcon);
+            }
         }
+        
+        // Add/update North reference line (green dashed - always points north)
+        const northEndPoint = calculateEndPoint(roverPosition.lat, roverPosition.lng, 0, 0.00008);
+        const northLinePoints = [[roverPosition.lat, roverPosition.lng], [northEndPoint.lat, northEndPoint.lng]];
+        if (!northLineRef.current) {
+            northLineRef.current = L.polyline(northLinePoints, { 
+                color: '#10b981',
+                weight: 3, 
+                opacity: 0.8,
+                dashArray: '10, 5'
+            }).addTo(mapRef.current);
+        } else {
+            northLineRef.current.setLatLngs(northLinePoints);
+        }
+        
+        // Add/update Rover heading line (red solid - points in rover's direction with smoothing)
+        const headingEndPoint = calculateEndPoint(roverPosition.lat, roverPosition.lng, smoothedHeading, 0.00008);
+        const headingLinePoints = [[roverPosition.lat, roverPosition.lng], [headingEndPoint.lat, headingEndPoint.lng]];
+        if (!roverHeadingLineRef.current) {
+            roverHeadingLineRef.current = L.polyline(headingLinePoints, { 
+                color: '#ef4444',
+                weight: 3, 
+                opacity: 0.9
+            }).addTo(mapRef.current);
+        } else {
+            roverHeadingLineRef.current.setLatLngs(headingLinePoints);
+        }
+        
         // shift samples for interpolation
         const now = performance.now();
         prevSampleRef.current = lastSampleRef.current;
-        lastSampleRef.current = { t: now, lat: roverPosition.lat, lng: roverPosition.lng, heading: heading || 0 };
+        lastSampleRef.current = { t: now, lat: roverPosition.lat, lng: roverPosition.lng, heading: smoothedHeading };
     } else if (roverMarkerRef.current) {
         roverMarkerRef.current.remove();
         roverMarkerRef.current = null;
+        if (northLineRef.current) {
+            northLineRef.current.remove();
+            northLineRef.current = null;
+        }
+        if (roverHeadingLineRef.current) {
+            roverHeadingLineRef.current.remove();
+            roverHeadingLineRef.current = null;
+        }
     }
   }, [roverPosition, heading]);
 
@@ -431,11 +542,58 @@ const MapView: React.FC<MapViewProps> = ({
     }
   }, [frameNow]);
   
+  // Fading travel path - creates new segment every 3 seconds, old segments fade out
   useEffect(() => {
       if (!mapRef.current) return;
+      
       if (roverPosition) {
-          if (!traveledPathLayerRef.current) traveledPathLayerRef.current = L.polyline([], { color: '#0ea5e9', weight: 4, opacity: 0.8 }).addTo(mapRef.current);
-          traveledPathLayerRef.current.addLatLng([roverPosition.lat, roverPosition.lng]);
+          const now = Date.now();
+          
+          // Add point to current segment or create new one
+          if (!traveledPathLayerRef.current || (pathSegmentsRef.current.length > 0 && 
+              now - pathSegmentsRef.current[pathSegmentsRef.current.length - 1].timestamp > 3000)) {
+              
+              // Create new segment every 3 seconds
+              const newPolyline = L.polyline([[roverPosition.lat, roverPosition.lng]], { 
+                  color: '#0ea5e9', 
+                  weight: 4, 
+                  opacity: 1.0 
+              }).addTo(mapRef.current);
+              
+              pathSegmentsRef.current.push({
+                  polyline: newPolyline,
+                  timestamp: now,
+                  points: [[roverPosition.lat, roverPosition.lng]]
+              });
+              
+              traveledPathLayerRef.current = newPolyline;
+          } else {
+              // Add to current segment
+              traveledPathLayerRef.current.addLatLng([roverPosition.lat, roverPosition.lng]);
+              if (pathSegmentsRef.current.length > 0) {
+                  pathSegmentsRef.current[pathSegmentsRef.current.length - 1].points.push([roverPosition.lat, roverPosition.lng]);
+              }
+          }
+          
+          // Fade and remove old segments (older than 3 seconds)
+          pathSegmentsRef.current = pathSegmentsRef.current.filter(segment => {
+              const age = now - segment.timestamp;
+              
+              if (age > 3000) {
+                  // Fade out over 1 second after 3 seconds
+                  const fadeAge = age - 3000;
+                  if (fadeAge < 1000) {
+                      const opacity = 1.0 - (fadeAge / 1000);
+                      segment.polyline.setStyle({ opacity: opacity });
+                      return true;
+                  } else {
+                      // Remove completely after fade
+                      segment.polyline.remove();
+                      return false;
+                  }
+              }
+              return true;
+          });
       }
   }, [roverPosition]);
 
@@ -547,8 +705,11 @@ const MapView: React.FC<MapViewProps> = ({
        
        {isConnectedToRover && roverPosition && typeof roverPosition.lat === 'number' && (
           <div className="absolute bottom-2 left-2 z-[1000] bg-black bg-opacity-60 text-white font-mono text-xs p-2 rounded-md">
-              <div>Lat: {roverPosition.lat.toFixed(6)}</div>
-              <div>Lng: {roverPosition.lng.toFixed(6)}</div>
+              <div>Lat: {roverPosition.lat.toFixed(7)}</div>
+              <div>Lng: {roverPosition.lng.toFixed(7)}</div>
+              <div className="text-green-400 text-[10px] mt-1">
+                Updated: {new Date().toLocaleTimeString()}
+              </div>
           </div>
        )}
 

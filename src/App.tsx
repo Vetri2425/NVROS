@@ -12,7 +12,7 @@ import ServoControlTab from './components/ServoControl/ServoControlTab';
 import { MissionFileInfo, Waypoint, ViewMode, RoverData } from './types';
 import { usePersistentState } from './hooks/usePersistentState';
 import { useMissionLogs } from './hooks/useMissionLogs';
-import { calculateDistancesForMission } from './utils/geo';
+import { calculateDistancesForMission, calculateDistance } from './utils/geo';
 import { toQGCWPL110 } from './utils/missionParser';
 import { RoverTelemetry } from './types/ros';
 import { ConnectionState } from './hooks/useRoverROS';
@@ -34,7 +34,11 @@ const mapFixTypeToLabel = (fixType: number): string => {
   }
 };
 
-const toRoverData = (telemetry: RoverTelemetry, connectionState: ConnectionState): RoverData => {
+const toRoverData = (
+  telemetry: RoverTelemetry, 
+  connectionState: ConnectionState,
+  missionWaypoints: Waypoint[] = []
+): RoverData => {
   const isConnected = connectionState === 'connected';
   const position =
     Number.isFinite(telemetry.global.lat) && Number.isFinite(telemetry.global.lon)
@@ -44,6 +48,15 @@ const toRoverData = (telemetry: RoverTelemetry, connectionState: ConnectionState
   const currentWp = telemetry.mission.current_wp ?? 0;
   const completedWaypointIds =
     currentWp > 1 ? Array.from({ length: currentWp - 1 }, (_, idx) => idx + 1) : [];
+
+  // Calculate distance to next waypoint
+  let distanceToNext = 0;
+  if (position && currentWp > 0 && missionWaypoints.length > 0) {
+    const nextWaypoint = missionWaypoints.find(wp => wp.id === currentWp);
+    if (nextWaypoint) {
+      distanceToNext = calculateDistance(position, { lat: nextWaypoint.lat, lng: nextWaypoint.lng });
+    }
+  }
 
   return {
     connected: isConnected,
@@ -79,14 +92,14 @@ const toRoverData = (telemetry: RoverTelemetry, connectionState: ConnectionState
         ? telemetry.mission.current_wp - 1
         : null,
     completedWaypointIds,
-    distanceToNext: 0,
+    distanceToNext,
     lastUpdate: telemetry.lastMessageTs ?? Date.now(),
     telemetryAgeMs: telemetry.lastMessageTs ? Date.now() - telemetry.lastMessageTs : undefined,
   };
 };
 
 const AppContent: React.FC = () => {
-  const { telemetry, connectionState, services } = useRover();
+  const { telemetry, connectionState, services, setMissionEventHandler } = useRover();
 
   const [viewMode, setViewMode] = usePersistentState<ViewMode>('app:viewMode', 'dashboard');
   const [missionWaypoints, setMissionWaypoints] = usePersistentState<Waypoint[]>(
@@ -111,7 +124,28 @@ const AppContent: React.FC = () => {
     missionLogs,
     getActiveLogEntries,
     clearLogs,
+    addLogEntry,
   } = useMissionLogs();
+
+  // Subscribe to mission events from the backend
+  useEffect(() => {
+    setMissionEventHandler((event) => {
+      // Convert backend event format to LogEntry format
+      addLogEntry({
+        event: event.message,
+        lat: event.lat ?? null,
+        lng: event.lng ?? null,
+        waypointId: event.waypointId ?? null,
+        status: event.status ?? null,
+        servoAction: event.servoAction ?? null,
+        timestamp: event.timestamp ? new Date(event.timestamp * 1000).toISOString() : undefined,
+      });
+    });
+
+    return () => {
+      setMissionEventHandler(null);
+    };
+  }, [setMissionEventHandler, addLogEntry]);
 
   useEffect(() => {
     const onFullscreenChange = () => setIsFullScreen(Boolean(document.fullscreenElement));
@@ -122,8 +156,8 @@ const AppContent: React.FC = () => {
   const isConnectedToRover = connectionState === 'connected';
 
   const uiRoverData: RoverData = useMemo(
-    () => toRoverData(telemetry, connectionState),
-    [telemetry, connectionState],
+    () => toRoverData(telemetry, connectionState, missionWaypoints),
+    [telemetry, connectionState, missionWaypoints],
   );
 
   const handleToggleFullScreen = () => {
@@ -318,6 +352,33 @@ const AppContent: React.FC = () => {
     [setSelectedWaypointIds],
   );
 
+  const handleDeleteSelectedWaypoints = useCallback(() => {
+    if (selectedWaypointIds.length === 0) return;
+    
+    const confirmDelete = window.confirm(
+      `Delete ${selectedWaypointIds.length} selected waypoint(s)?`
+    );
+    
+    if (confirmDelete) {
+      setMissionWaypoints((prev) =>
+        calculateDistancesForMission(
+          prev.filter((wp) => !selectedWaypointIds.includes(wp.id))
+        )
+      );
+      setSelectedWaypointIds([]);
+    }
+  }, [selectedWaypointIds, setMissionWaypoints, setSelectedWaypointIds]);
+
+  const handleSelectAllWaypoints = useCallback(() => {
+    if (selectedWaypointIds.length === missionWaypoints.length) {
+      // If all selected, deselect all
+      setSelectedWaypointIds([]);
+    } else {
+      // Select all
+      setSelectedWaypointIds(missionWaypoints.map((wp) => wp.id));
+    }
+  }, [missionWaypoints, selectedWaypointIds, setSelectedWaypointIds]);
+
   const commonMapProps = {
     missionWaypoints,
     onMapClick: handleMapClick,
@@ -352,6 +413,8 @@ const AppContent: React.FC = () => {
                   activeWaypointIndex={uiRoverData.activeWaypointIndex}
                   selectedWaypointIds={selectedWaypointIds}
                   onWaypointSelectionChange={handleWaypointSelectionChange}
+                  onDeleteSelected={handleDeleteSelectedWaypoints}
+                  onSelectAll={handleSelectAllWaypoints}
                 />
               </div>
             </div>

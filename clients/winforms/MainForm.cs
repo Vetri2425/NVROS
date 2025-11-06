@@ -17,7 +17,7 @@ namespace FlashRoverWinForms
         private readonly Label _lblAge = new() { AutoSize = true };
 
         private SocketIO? _socket;
-        private string _backendUrl = Environment.GetEnvironmentVariable("JETSON_BACKEND_URL") ?? "http://192.168.1.20:5000";
+        private string _backendUrl = Environment.GetEnvironmentVariable("JETSON_BACKEND_URL") ?? "http://192.168.1.100:5000";
         private DateTimeOffset? _lastUpdate;
 
         public MainForm()

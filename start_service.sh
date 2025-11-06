@@ -166,6 +166,10 @@ start_ros_process "MAVROS" \
     "ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:115200 gcs_url:=tcp-l://0.0.0.0:5761" \
     "/mavros" || exit 1
 
+start_ros_process "GPS Altitude Corrector" \
+    "python3 Backend/gps_altitude_corrector.py" \
+    "/gps_altitude_corrector"
+
 start_ros_process "Telemetry Node" \
     "python3 -m Backend.telemetry_node" \
     ""
@@ -174,8 +178,6 @@ start_backend || exit 1
 
 log "Active ROS nodes:"
 ros2 node list || true
-
-sudo systemctl restart rosbridge.service
 
 # cd "$PROJECT_ROOT"
 # log "Starting NRP frontend..."

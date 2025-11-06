@@ -19,12 +19,14 @@ const LiveReportView: React.FC<LiveReportViewProps> = ({
   missionName,
   isConnected,
 }) => {
-  const activeWaypointId =
-    liveRoverData.activeWaypointIndex !== null && liveRoverData.activeWaypointIndex !== undefined
-      ? liveRoverData.activeWaypointIndex + 1
-      : null;
-
-  const currentWaypointSeq = liveRoverData.mission_progress?.current || liveRoverData.activeWaypointIndex || 0;
+  // Current waypoint sequence from mission progress
+  const currentWaypointSeq = liveRoverData.mission_progress?.current || 0;
+  const activeWaypointId = currentWaypointSeq > 0 ? currentWaypointSeq : null;
+  
+  // Build completed waypoint IDs based on current waypoint
+  const completedWaypointIds = currentWaypointSeq > 1 
+    ? Array.from({ length: currentWaypointSeq - 1 }, (_, idx) => idx + 1) 
+    : [];
 
   return (
     <div className="flex-1 flex flex-col p-4 gap-4 overflow-hidden">
@@ -35,7 +37,7 @@ const LiveReportView: React.FC<LiveReportViewProps> = ({
           <WaypointStatusList
             waypoints={missionWaypoints}
             activeWaypointId={activeWaypointId}
-            completedWaypointIds={liveRoverData.completedWaypointIds}
+            completedWaypointIds={completedWaypointIds}
           />
         </aside>
 

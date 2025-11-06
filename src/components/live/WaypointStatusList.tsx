@@ -33,7 +33,7 @@ const WaypointStatusList: React.FC<WaypointStatusListProps> = ({
             <tr className="text-gray-400">
               <th className="px-2 py-1 font-semibold">Name</th>
               <th className="px-2 py-1 font-semibold">Status</th>
-              <th className="px-2 py-1 font-semibold text-right">Δ Elevation</th>
+              <th className="px-2 py-1 font-semibold text-right">Altitude</th>
             </tr>
           </thead>
         </table>
@@ -62,20 +62,25 @@ const WaypointStatusList: React.FC<WaypointStatusListProps> = ({
                   <td className="px-2 py-2 font-mono">{`p${wp.id}`}</td>
                   <td className="px-2 py-2">
                     {isCompleted && <CheckCircleIcon className="w-5 h-5 text-green-500" />}
-                    {!isCompleted && <span>-</span>}
+                    {isActive && !isCompleted && (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold bg-orange-500 text-white">
+                        Active
+                      </span>
+                    )}
+                    {!isCompleted && !isActive && <span className="text-gray-500">-</span>}
                   </td>
                   <td className="px-2 py-2 font-mono text-right">
-                    {isCompleted && deltaAlt !== null && (
+                    <span className="text-gray-300">{wp.alt.toFixed(1)} m</span>
+                    {deltaAlt !== null && (
                       <span
-                        className={`font-bold px-2 py-0.5 rounded ${
+                        className={`ml-2 font-bold text-xs px-1.5 py-0.5 rounded ${
                           deltaAlt >= 0 ? 'bg-green-500/80 text-white' : 'bg-red-500/80 text-white'
                         }`}
                       >
                         {deltaAlt >= 0 ? '+' : ''}
-                        {deltaAlt.toFixed(2)}' f {deltaAlt >= 0 ? '↑' : '↓'}
+                        {deltaAlt.toFixed(1)}
                       </span>
                     )}
-                     {!isCompleted && <span>-</span>}
                   </td>
                 </tr>
               );

@@ -1,0 +1,311 @@
+"""
+WP_MARK Retry Mechanism Module
+Provides retry logic with exponential backoff for robust operation handling
+
+Optional Dependencies:
+- nest-asyncio: For nested event loop support in async retry operations
+  Install with: pip install nest-asyncio (optional - has fallback)
+"""
+
+import time
+import random
+import logging
+from typing import Callable, Any, Optional, Dict, List
+from functools import wraps
+
+
+class RetryError(Exception):
+    """Raised when all retry attempts are exhausted"""
+    pass
+
+
+class RetryConfig:
+    """Configuration for retry behavior"""
+
+    def __init__(self,
+                 max_attempts: int = 3,
+                 initial_delay: float = 1.0,
+                 max_delay: float = 30.0,
+                 backoff_factor: float = 2.0,
+                 jitter: bool = True,
+                 retry_on_exceptions: tuple = (Exception,)):
+        """
+        Initialize retry configuration
+
+        Args:
+            max_attempts: Maximum number of retry attempts
+            initial_delay: Initial delay between retries (seconds)
+            max_delay: Maximum delay between retries (seconds)
+            backoff_factor: Exponential backoff multiplier
+            jitter: Add random jitter to delay
+            retry_on_exceptions: Tuple of exception types to retry on
+        """
+        self.max_attempts = max_attempts
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.backoff_factor = backoff_factor
+        self.jitter = jitter
+        self.retry_on_exceptions = retry_on_exceptions
+
+
+class RetryMechanism:
+    """Retry mechanism with exponential backoff and jitter"""
+
+    def __init__(self, config: RetryConfig, logger: Optional[logging.Logger] = None):
+        """
+        Initialize retry mechanism
+
+        Args:
+            config: Retry configuration
+            logger: Optional logger instance
+        """
+        self.config = config
+        self.logger = logger or logging.getLogger('RetryMechanism')
+        self._attempt_stats: List[Dict[str, Any]] = []
+
+    def execute(self, func: Callable, *args, **kwargs) -> Any:
+        """
+        Execute function with retry logic
+
+        Args:
+            func: Function to execute
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Function result
+
+        Raises:
+            RetryError: If all attempts fail
+        """
+        last_exception = None
+
+        for attempt in range(self.config.max_attempts):
+            try:
+                result = func(*args, **kwargs)
+                self._record_success(attempt)
+                return result
+
+            except self.config.retry_on_exceptions as e:
+                last_exception = e
+                self._record_attempt(attempt, str(e))
+
+                if attempt < self.config.max_attempts - 1:
+                    delay = self._calculate_delay(attempt)
+                    self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {delay:.2f}s")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"All {self.config.max_attempts} attempts failed. Last error: {str(e)}")
+
+        raise RetryError(f"Operation failed after {self.config.max_attempts} attempts") from last_exception
+
+    def execute_async(self, func: Callable, *args, **kwargs) -> Any:
+        """
+        Execute async function with retry logic
+
+        Args:
+            func: Async function to execute
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Function result
+        """
+        import asyncio
+
+        async def _execute_async():
+            last_exception = None
+
+            for attempt in range(self.config.max_attempts):
+                try:
+                    if asyncio.iscoroutinefunction(func):
+                        result = await func(*args, **kwargs)
+                    else:
+                        result = func(*args, **kwargs)
+                    self._record_success(attempt)
+                    return result
+
+                except self.config.retry_on_exceptions as e:
+                    last_exception = e
+                    self._record_attempt(attempt, str(e))
+
+                    if attempt < self.config.max_attempts - 1:
+                        delay = self._calculate_delay(attempt)
+                        self.logger.warning(f"Async attempt {attempt + 1} failed: {str(e)}. Retrying in {delay:.2f}s")
+                        await asyncio.sleep(delay)
+
+            raise RetryError(f"Async operation failed after {self.config.max_attempts} attempts") from last_exception
+
+        # Run the async function
+        try:
+            import asyncio
+            return asyncio.run(_execute_async())
+        except RuntimeError:
+            # Already in an event loop - run directly
+            # Note: nest_asyncio is optional; if needed, install with: pip install nest-asyncio
+            try:
+                import nest_asyncio  # type: ignore[import-not-found]
+                nest_asyncio.apply()
+                return asyncio.run(_execute_async())
+            except ImportError:
+                # Fallback: create new event loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(_execute_async())
+                finally:
+                    loop.close()
+
+    def _calculate_delay(self, attempt: int) -> float:
+        """Calculate delay for next retry attempt"""
+        delay = self.config.initial_delay * (self.config.backoff_factor ** attempt)
+        delay = min(delay, self.config.max_delay)
+
+        if self.config.jitter:
+            # Add random jitter (±25%)
+            jitter_range = delay * 0.25
+            delay += random.uniform(-jitter_range, jitter_range)
+
+        return max(0.1, delay)  # Minimum 100ms delay
+
+    def _record_attempt(self, attempt: int, error: str):
+        """Record failed attempt"""
+        self._attempt_stats.append({
+            'attempt': attempt + 1,
+            'timestamp': time.time(),
+            'success': False,
+            'error': error
+        })
+
+    def _record_success(self, attempt: int):
+        """Record successful attempt"""
+        self._attempt_stats.append({
+            'attempt': attempt + 1,
+            'timestamp': time.time(),
+            'success': True,
+            'error': None
+        })
+
+        # Keep only last 50 attempts
+        if len(self._attempt_stats) > 50:
+            self._attempt_stats = self._attempt_stats[-50:]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get retry statistics
+
+        Returns:
+            Statistics dictionary
+        """
+        if not self._attempt_stats:
+            return {'total_attempts': 0, 'success_rate': 0.0}
+
+        total_attempts = len(self._attempt_stats)
+        successful_attempts = sum(1 for stat in self._attempt_stats if stat['success'])
+        success_rate = successful_attempts / total_attempts if total_attempts > 0 else 0.0
+
+        recent_attempts = self._attempt_stats[-10:]  # Last 10 attempts
+        recent_success_rate = sum(1 for stat in recent_attempts if stat['success']) / len(recent_attempts) if recent_attempts else 0.0
+
+        return {
+            'total_attempts': total_attempts,
+            'successful_attempts': successful_attempts,
+            'success_rate': round(success_rate, 3),
+            'recent_success_rate': round(recent_success_rate, 3),
+            'last_attempt': self._attempt_stats[-1] if self._attempt_stats else None
+        }
+
+
+def retry_on_failure(config: Optional[RetryConfig] = None,
+                    logger: Optional[logging.Logger] = None):
+    """
+    Decorator for automatic retry on failure
+
+    Args:
+        config: Retry configuration (default if None)
+        logger: Logger instance
+
+    Returns:
+        Decorated function
+    """
+    if config is None:
+        config = RetryConfig()
+
+    def decorator(func: Callable) -> Callable:
+        retry_mechanism = RetryMechanism(config, logger)
+
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            return retry_mechanism.execute(func, *args, **kwargs)
+
+        # Store retry mechanism for inspection
+        wrapper._retry_mechanism = retry_mechanism
+        return wrapper
+
+    return decorator
+
+
+def create_operation_retry_configs() -> Dict[str, RetryConfig]:
+    """
+    Create retry configurations for different operation types
+
+    Returns:
+        Dictionary of operation types to retry configs
+    """
+    return {
+        'servo_command': RetryConfig(
+            max_attempts=3,
+            initial_delay=0.5,
+            max_delay=5.0,
+            backoff_factor=1.5,
+            retry_on_exceptions=(Exception,)
+        ),
+        'waypoint_pull': RetryConfig(
+            max_attempts=2,
+            initial_delay=1.0,
+            max_delay=10.0,
+            backoff_factor=2.0,
+            retry_on_exceptions=(Exception,)
+        ),
+        'waypoint_set': RetryConfig(
+            max_attempts=3,
+            initial_delay=0.5,
+            max_delay=3.0,
+            backoff_factor=1.5,
+            retry_on_exceptions=(Exception,)
+        ),
+        'gps_operation': RetryConfig(
+            max_attempts=5,
+            initial_delay=0.2,
+            max_delay=2.0,
+            backoff_factor=1.2,
+            retry_on_exceptions=(Exception,)
+        ),
+        'config_save': RetryConfig(
+            max_attempts=2,
+            initial_delay=0.1,
+            max_delay=1.0,
+            backoff_factor=1.5,
+            retry_on_exceptions=(OSError, IOError)
+        )
+    }
+
+
+# Global retry configurations
+OPERATION_RETRY_CONFIGS = create_operation_retry_configs()
+
+
+def get_retry_mechanism(operation_type: str,
+                       logger: Optional[logging.Logger] = None) -> RetryMechanism:
+    """
+    Get retry mechanism for specific operation type
+
+    Args:
+        operation_type: Type of operation
+        logger: Optional logger
+
+    Returns:
+        Configured retry mechanism
+    """
+    config = OPERATION_RETRY_CONFIGS.get(operation_type, RetryConfig())
+    return RetryMechanism(config, logger)

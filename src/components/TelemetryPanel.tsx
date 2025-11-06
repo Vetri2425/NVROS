@@ -18,23 +18,9 @@ const safeFixed = (value: number, digits: number): string => {
 
 const TelemetryPanel: React.FC = () => {
   const { telemetry, connectionState } = useRover();
-  const { state, global, battery, mission, rtk, lastMessageTs } = telemetry;
+  const { state, global, battery, mission, lastMessageTs } = telemetry;
 
   const armed = state.armed ? 'Yes' : 'No';
-  const rtkLabel = (() => {
-    switch (rtk.fix_type) {
-      case 4:
-        return 'RTK Fixed';
-      case 3:
-        return 'RTK Float';
-      case 2:
-        return 'DGPS';
-      case 1:
-        return 'GPS Fix';
-      default:
-        return 'No Fix';
-    }
-  })();
 
   return (
     <div className="bg-[#111827] rounded-lg overflow-hidden flex flex-col">
@@ -105,17 +91,6 @@ const TelemetryPanel: React.FC = () => {
             <p className="font-semibold">
               {safeFixed(mission.progress_pct, 1)}% ({mission.current_wp}/{mission.total_wp})
             </p>
-          </div>
-        </section>
-
-        <section className="grid grid-cols-2 gap-3">
-          <div>
-            <p className="text-xs uppercase text-slate-400">RTK</p>
-            <p className="font-semibold">{rtkLabel}</p>
-          </div>
-          <div>
-            <p className="text-xs uppercase text-slate-400">Satellites</p>
-            <p className="font-semibold">{global.satellites_visible}</p>
           </div>
         </section>
 

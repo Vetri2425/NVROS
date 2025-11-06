@@ -1,8 +1,10 @@
 {
   "wp_mark": {
-    "delay_before_on": 1,
-    "spray_duration": 1,
-    "delay_after_off": 1,
+    "mode": "active",
+    "delay_before_on": 10,
+    "spray_duration": 10,
+    "delay_after_off": 10,
+    "waypoint_proximity_threshold": 2,
     "servo_number": 10,
     "pwm_on": 650,
     "pwm_off": 1000

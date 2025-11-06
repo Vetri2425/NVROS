@@ -23,6 +23,16 @@ export interface TelemetryRtk {
   fix_type: number;
   baseline_age: number;
   base_linked: boolean;
+  baseline_distance?: number; // Distance from base station in meters
+  baseline_coords?: {
+    a_mm: number;
+    b_mm: number;
+    c_mm: number;
+  };
+  accuracy?: number;
+  nsats?: number;
+  rtk_health?: number;
+  rtk_rate?: number;
 }
 
 export interface TelemetryMission {

@@ -34,11 +34,69 @@ except Exception:
     # When running as a script from the Backend directory
     from mavros_bridge import MavrosBridge  # type: ignore
 
+# Import network monitor for WiFi/LoRa status
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.network_monitor import NetworkMonitor
+
 # --- Flask & SocketIO Setup ---
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Enhanced CORS handling for external browser access
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight OPTIONS requests"""
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        headers = response.headers
+        headers['Access-Control-Allow-Origin'] = '*'
+        headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+        headers['Access-Control-Max-Age'] = '3600'
+        return response
+
+
+@app.before_request
+def log_request():
+    """Log incoming HTTP requests for debugging."""
+    # Skip logging for health checks to reduce noise
+    if request.path != '/api/health':
+        app.logger.info(f"{request.method} {request.path} from {request.remote_addr}")
+
+
+@app.after_request
+def log_response(response):
+    """Log HTTP responses for debugging."""
+    # Skip logging for health checks to reduce noise
+    if request.path != '/api/health':
+        app.logger.info(f"Response: {response.status_code} for {request.method} {request.path}")
+    
+    # Ensure CORS headers are set on all responses
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
+
+
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
                     ping_timeout=60, ping_interval=25)
+
+# Register WP_MARK Blueprint
+try:
+    try:
+        # When running as a package
+        from .servo_manager.wp_mark.api_routes import wp_mark_bp
+    except ImportError:
+        # When running as a script
+        from servo_manager.wp_mark.api_routes import wp_mark_bp
+    
+    app.register_blueprint(wp_mark_bp)
+    print("[INFO] WP_MARK API routes registered successfully", flush=True)
+except Exception as e:
+    print(f"[WARN] Failed to register WP_MARK routes: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
 
 ROS_DISTRO = os.environ.get('ROS_DISTRO', 'humble')
 _ros_lib_dir = f"/opt/ros/{ROS_DISTRO}/lib"
@@ -79,6 +137,33 @@ except Exception as exc:
     SetMode = None  # type: ignore
     ROS_IMPORT_ERROR = exc
     print(f"[WARN] ROS2 support disabled: {exc}", flush=True)
+
+
+def log_message(message, level='INFO', event_type: str = 'general', meta=None):
+    """Simple logger that prints to stdout, stores activity, and emits to frontend."""
+    try:
+        record_activity(message, level=level, event_type=event_type, meta=meta)
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        text = f"[{ts}] [{level}] {message}"
+        print(text, flush=True)
+        try:
+            socketio.emit('server_log', {'message': text, 'level': level})
+        except Exception:
+            pass
+    except Exception:
+        try:
+            print(f"[LOG-ERR] {message}", flush=True)
+        except Exception:
+            pass
+
+
+if not ROS_AVAILABLE and ROS_IMPORT_ERROR is not None:
+    log_message(
+        f"ROS2 features disabled: {ROS_IMPORT_ERROR}",
+        level='WARNING',
+        event_type='startup',
+        meta={'ros_distro': ROS_DISTRO}
+    )
 
 if ROS_AVAILABLE:
 
@@ -279,6 +364,16 @@ def _shutdown_ros_runtime() -> None:
 
 atexit.register(_shutdown_ros_runtime)
 
+# Register WP_MARK cleanup
+try:
+    try:
+        from .servo_manager.wp_mark.api_routes import cleanup_wp_mark
+    except ImportError:
+        from servo_manager.wp_mark.api_routes import cleanup_wp_mark
+    atexit.register(cleanup_wp_mark)
+except Exception:
+    pass
+
 
 def _acquire_singleton_lock() -> None:
     """Prevent multiple backend instances from sharing the same TCP port."""
@@ -352,6 +447,7 @@ class CurrentState:
     # Will be set when GPS available
     position: Optional[Position] = None
     heading: float = 0.0
+    
     battery: int = -1
     status: str = 'disarmed'
     mode: str = 'UNKNOWN'
@@ -364,11 +460,23 @@ class CurrentState:
     hrms: str = '0.000'
     vrms: str = '0.000'
     imu_status: str = 'UNALIGNED'
+    imu: Optional[dict] = None
+    satellites_visible: int = 0
     activeWaypointIndex: Optional[int] = None
     completedWaypointIds: List[int] = field(default_factory=list)
     distanceToNext: float = 0.0
     # Servo output telemetry (PWM values from /mavros/rc/out)
     servo_output: Optional[dict] = None
+    # Ground speed (m/s) as derived from MAVROS velocity or ROS2 telemetry
+    groundspeed: float = 0.0
+    # RTK detailed status (for frontend RTKPanel)
+    rtk_fix_type: int = 0
+    rtk_baseline_age: float = 0.0
+    rtk_base_linked: bool = False
+    # Raw RTK baseline payload (from /mavros/gps_rtk/rtk_baseline)
+    rtk_baseline: Optional[dict] = None
+    # Timestamp (seconds since epoch) when last baseline was received
+    rtk_baseline_ts: Optional[float] = None
     # Timestamp pushed to frontend (seconds since epoch)
     last_update: Optional[float] = None
 
@@ -379,6 +487,10 @@ class CurrentState:
 
 # Initialize current vehicle state
 current_state = CurrentState()
+
+# Initialize network monitor for WiFi and LoRa status telemetry
+# Cache duration of 3 seconds to avoid overhead in high-frequency telemetry loop
+network_monitor = NetworkMonitor(interface="wlan0", cache_duration=3.0)
 
 mission_upload_lock = threading.Lock()
 mission_download_lock = threading.Lock()
@@ -414,6 +526,9 @@ _activity_log_lock = threading.Lock()
 _activity_seq = count(1)
 TELEMETRY_ACTIVITY_INTERVAL = float(os.getenv('TELEMETRY_ACTIVITY_INTERVAL', '5.0'))
 _last_telemetry_activity_log: float = 0.0
+
+# HTTP response tracking log
+_response_log: list[dict] = []
 
 def _make_json_safe(obj, depth: int = 2):
     """Return a JSON-serialisable version of obj, truncating deeply nested data."""
@@ -502,31 +617,6 @@ ROVER_MODES = {
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def log_message(message, level='INFO', event_type: str = 'general', meta=None):
-    """Simple logger that prints to stdout, stores activity, and emits to frontend."""
-    try:
-        record_activity(message, level=level, event_type=event_type, meta=meta)
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        text = f"[{ts}] [{level}] {message}"
-        print(text, flush=True)
-        try:
-            socketio.emit('server_log', {'message': text, 'level': level})
-        except Exception:
-            pass
-    except Exception:
-        try:
-            print(f"[LOG-ERR] {message}", flush=True)
-        except Exception:
-            pass
-
-if not ROS_AVAILABLE and ROS_IMPORT_ERROR is not None:
-    log_message(
-        f"ROS2 features disabled: {ROS_IMPORT_ERROR}",
-        level='WARNING',
-        event_type='startup',
-        meta={'ros_distro': ROS_DISTRO}
-    )
-
 
 @app.before_request
 def _track_http_request():
@@ -557,24 +647,44 @@ def _track_http_request():
 
 
 @app.after_request
-def _track_http_response(response):
-    """Record outgoing HTTP responses for observability."""
+def unified_response_handler(response):
+    """Unified handler: Add CORS headers + track HTTP responses"""
+    # Add CORS headers
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    
+    # Track HTTP responses for observability
     try:
         if request.path.startswith('/socket.io'):
             return response
-        level = 'INFO' if response.status_code < 400 else 'ERROR'
-        record_activity(
-            f"HTTP {request.method} {request.path} responded",
-            level=level,
-            event_type='server_response',
-            meta={
-                'status': response.status_code,
-                'content_type': response.content_type,
-                'length': response.content_length,
-            }
-        )
+        method = request.method
+        path = request.path
+        status = response.status_code
+        _response_log.append({
+            'ts': time.time(),
+            'method': method,
+            'path': path,
+            'status': status
+        })
+        # Keep last 500
+        if len(_response_log) > 500:
+            _response_log.pop(0)
     except Exception:
         pass
+    
+    level = 'INFO' if response.status_code < 400 else 'ERROR'
+    record_activity(
+        f"HTTP {request.method} {request.path} responded",
+        level=level,
+        event_type='server_response',
+        meta={
+            'status': response.status_code,
+            'content_type': response.content_type,
+            'length': response.content_length,
+        }
+    )
+    
     return response
 
 
@@ -630,7 +740,9 @@ def _merge_ros2_telemetry(payload: dict) -> None:
     now = time.time()
     try:
         state = payload.get('state')
-        position = payload.get('position')
+        global_data = payload.get('global')
+        position = payload.get('position')  # Legacy support
+        rtk = payload.get('rtk')
 
         with mavros_telem_lock:
             if isinstance(state, dict):
@@ -660,13 +772,125 @@ def _merge_ros2_telemetry(payload: dict) -> None:
                     )
                 current_state.last_update = now
 
-            if isinstance(position, dict):
+            # Process global position data (NEW FORMAT)
+            if isinstance(global_data, dict):
+                lat = global_data.get('latitude')
+                lon = global_data.get('longitude')
+                alt = global_data.get('altitude')
+                vel = global_data.get('vel')
+                satellites = global_data.get('satellites_visible')
+                
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                    current_state.position = Position(lat=float(lat), lng=float(lon))
+                    changed = True
+                    current_state.last_update = now
+                
+                # Update satellites count
+                if isinstance(satellites, (int, float)):
+                    if int(satellites) != current_state.satellites_visible:
+                        current_state.satellites_visible = int(satellites)
+                        changed = True
+
+                # Map velocity from ROS2 'global.vel' into shared groundspeed field
+                try:
+                    if isinstance(vel, (int, float)):
+                        new_gs = float(vel)
+                        if current_state.groundspeed != new_gs:
+                            current_state.groundspeed = new_gs
+                            changed = True
+                except Exception:
+                    pass
+
+            # Legacy position format support
+            elif isinstance(position, dict):
                 lat = position.get('latitude')
                 lon = position.get('longitude')
                 if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
                     current_state.position = Position(lat=float(lat), lng=float(lon))
                     changed = True
                     current_state.last_update = now
+
+            # Process RTK status data (NEW)
+            if isinstance(rtk, dict):
+                fix_type = rtk.get('fix_type')
+                baseline_age = rtk.get('baseline_age')
+                base_linked = rtk.get('base_linked')
+                
+                if isinstance(fix_type, (int, float)):
+                    fix_type_int = int(fix_type)
+                    # Map fix type to RTK status string
+                    rtk_status_map = {
+                        0: 'No GPS',
+                        1: 'GPS Fix',
+                        2: 'DGPS',
+                        3: 'RTK Float',
+                        4: 'RTK Fixed'
+                    }
+                    new_rtk_status = rtk_status_map.get(fix_type_int, 'No GPS')
+                    if new_rtk_status != current_state.rtk_status:
+                        current_state.rtk_status = new_rtk_status
+                        changed = True
+                    
+                    # Update detailed RTK fields for frontend
+                    if current_state.rtk_fix_type != fix_type_int:
+                        current_state.rtk_fix_type = fix_type_int
+                        changed = True
+                
+                if isinstance(baseline_age, (int, float)):
+                    baseline_age_float = float(baseline_age)
+                    if current_state.rtk_baseline_age != baseline_age_float:
+                        current_state.rtk_baseline_age = baseline_age_float
+                        changed = True
+                
+                if isinstance(base_linked, bool):
+                    if current_state.rtk_base_linked != base_linked:
+                        current_state.rtk_base_linked = base_linked
+                        changed = True
+
+            # Process battery telemetry if provided via ROS2 bridge (/nrp/telemetry)
+            battery = payload.get('battery')
+            if isinstance(battery, dict):
+                try:
+                    pct = battery.get('percentage')
+                    volt = battery.get('voltage')
+                    curr = battery.get('current')
+                    # Accept either fraction (0.0-1.0) or percent (0-100)
+                    if pct is not None:
+                        try:
+                            pctf = float(pct)
+                            # Check for NaN or invalid values
+                            import math
+                            if not math.isnan(pctf) and not math.isinf(pctf):
+                                if pctf <= 1.0:
+                                    pct_val = max(0, int(round(pctf * 100)))
+                                else:
+                                    pct_val = max(0, int(round(pctf)))
+                                if current_state.battery != pct_val:
+                                    current_state.battery = pct_val
+                                    changed = True
+                        except Exception:
+                            pass
+                    # Debug: log battery values received from ROS2 telemetry
+                    try:
+                        log_message(f"ROS2 telemetry battery: pct={pct}, volt={volt}, curr={curr}", 'DEBUG', event_type='ros_topic')
+                    except Exception:
+                        pass
+                    if volt is not None:
+                        try:
+                            current_state.voltage = float(volt)  # may be used by future UI
+                            changed = True
+                        except Exception:
+                            pass
+                    if curr is not None:
+                        try:
+                            current_state.current = float(curr)  # may be used by future UI
+                            changed = True
+                        except Exception:
+                            pass
+                    if changed:
+                        current_state.last_update = now
+                except Exception:
+                    pass
     except Exception as exc:
         log_message(f"Failed to merge ROS2 telemetry: {exc}", "WARNING", event_type='ros_topic')
         return
@@ -920,25 +1144,22 @@ def _build_mavros_waypoints(waypoints: List[dict]) -> List[dict]:
         command_id = resolve_mav_command(wp.get("command"))
         frame = int(safe_float(wp.get("frame", mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT),
                                mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT))
-        autocontinue = int(bool(safe_float(wp.get("autocontinue", 1), 1)))
+        autocontinue = bool(safe_float(wp.get("autocontinue", 1), 1))
         param1 = safe_float(wp.get("param1", 0.0))
         param2 = safe_float(wp.get("param2", 0.0))
         param3 = safe_float(wp.get("param3", 0.0))
         param4 = safe_float(wp.get("param4", 0.0))
 
-        if command_requires_nav_coordinates(command_id):
-            lat = safe_float(wp.get("lat", wp.get("x", 0.0)))
-            lon = safe_float(wp.get("lng", wp.get("y", 0.0)))
-            alt = safe_float(wp.get("alt", wp.get("z", 0.0)))
-        else:
-            lat = safe_float(wp.get("x", 0.0))
-            lon = safe_float(wp.get("y", 0.0))
-            alt = safe_float(wp.get("alt", wp.get("z", 0.0)))
+        # Unified coordinate extraction - always prioritize lat/lng field names for consistency
+        # This ensures coordinates are never swapped regardless of command type
+        lat = safe_float(wp.get("lat", wp.get("x_lat", 0.0)))
+        lon = safe_float(wp.get("lng", wp.get("y_long", 0.0)))
+        alt = safe_float(wp.get("alt", wp.get("z_alt", 0.0)))
 
         mavros_waypoints.append({
             "frame": frame,
             "command": command_id,
-            "is_current": 1 if idx == 0 else 0,
+            "is_current": idx == 0,
             "autocontinue": autocontinue,
             "param1": param1,
             "param2": param2,
@@ -994,6 +1215,14 @@ def emit_rover_data_now(reason: str | None = None) -> None:
     """Emit current_state to all clients with throttling bookkeeping."""
     global last_emit_monotonic
     data = get_rover_data()
+    
+    # DEBUG: Log position data being sent to frontend
+    if data.get('position'):
+        pos = data['position']
+        print(f"[EMIT] Sending rover_data ({reason}): position={pos}", flush=True)
+    else:
+        print(f"[EMIT] Sending rover_data ({reason}): NO POSITION DATA", flush=True)
+    
     try:
         socketio.emit('rover_data', data)
         if reason:
@@ -1034,7 +1263,40 @@ def get_rover_data():
         )
     except Exception:
         pass
-    return current_state.to_dict()
+    
+    data = current_state.to_dict()
+    
+    # Add network telemetry (WiFi signal strength and LoRa status)
+    try:
+        network_data = network_monitor.get_network_data()
+        data['network'] = network_data
+    except Exception as e:
+        # Provide safe defaults on network monitoring failure
+        print(f"[WARN] Network monitoring error: {e}", flush=True)
+        data['network'] = {
+            'connection_type': 'none',
+            'wifi_signal_strength': 0,
+            'wifi_rssi': -100,
+            'interface': 'unknown',
+            'wifi_connected': False,
+            'lora_connected': False
+        }
+    
+    # Compute baseline age dynamically from last baseline timestamp if available
+    try:
+        if getattr(current_state, 'rtk_baseline_ts', None) is not None:
+            age = time.time() - float(current_state.rtk_baseline_ts)
+            # Update the dataclass value so emitted dict contains current age
+            current_state.rtk_baseline_age = float(age)
+            # Ensure the emitted dict reflects updated value
+            data = current_state.to_dict()
+    except Exception:
+        pass
+
+    # Debug: Log RTK fix type being sent
+    print(f"[DEBUG] get_rover_data() sending rtk_fix_type={current_state.rtk_fix_type}, rtk_base_linked={current_state.rtk_base_linked}, rtk_baseline_age={current_state.rtk_baseline_age}", flush=True)
+    
+    return data
 
 
 # ============================================================================
@@ -1120,29 +1382,100 @@ def _handle_mavros_telemetry(message: dict) -> None:
             lat = message.get("latitude")
             lon = message.get("longitude")
             alt = message.get("altitude", 0.0)
+            
+            # DEBUG: Log navsat message reception
+            print(f"[SERVER] Received navsat: lat={lat}, lon={lon}, alt={alt}", flush=True)
+            
             if lat is not None and lon is not None:
                 with mavros_telem_lock:
                     current_state.position = Position(lat=float(lat), lng=float(lon))
                     current_state.last_update = time.time()
                     current_state.distanceToNext = float(alt or 0.0)
+                    print(f"[SERVER] Updated current_state.position: lat={current_state.position.lat:.7f}, lng={current_state.position.lng:.7f}", flush=True)
                 schedule_fast_emit()
 
         elif msg_type == "gps_fix":
+            # gps_fix messages may come from the bridge with either derived hrms/vrms
+            # fields (preferred) or as a standard NavSatFix-like payload with
+            # position_covariance. Prefer explicit hrms/vrms when provided.
             status = message.get("status")
+            fix_type = message.get("fix_type")
+            satellites_visible = message.get("satellites_visible")
             covariance = message.get("position_covariance", [])
+            hrms_msg = message.get("hrms")
+            vrms_msg = message.get("vrms")
+
             with mavros_telem_lock:
                 current_state.rtk_status = _map_navsat_status(status)
-                if isinstance(covariance, list) and len(covariance) >= 3:
+
+                # RTK fix type added - Update detailed RTK fields for frontend RTKPanel
+                if fix_type is not None:
+                    fix_type_int = int(fix_type)
+                    current_state.rtk_fix_type = fix_type_int
+                    # Respect recent RTK baseline information if present; only infer from fix_type
+                    # when no recent baseline has been received (fallback).
+                    try:
+                        baseline_ts = getattr(current_state, 'rtk_baseline_ts', None)
+                        if baseline_ts is None or (time.time() - float(baseline_ts)) > 5.0:
+                            current_state.rtk_base_linked = (fix_type_int >= 5)
+                    except Exception:
+                        current_state.rtk_base_linked = (fix_type_int >= 5)
+
+                # Update satellites count
+                if satellites_visible is not None:
+                    current_state.satellites_visible = int(satellites_visible)
+
+                # Extract baseline age if available
+                baseline_age = message.get("baseline_age")
+                if baseline_age is not None:
+                    current_state.rtk_baseline_age = float(baseline_age)
+
+                # Prefer explicit hrms/vrms published by the bridge
+                try:
+                    if hrms_msg is not None:
+                        current_state.hrms = f"{float(hrms_msg):.3f}"
+                    if vrms_msg is not None:
+                        current_state.vrms = f"{float(vrms_msg):.3f}"
+                except Exception:
+                    # ignore malformed values and fall back to covariance
+                    pass
+
+                # Fallback: compute from NavSat covariance if explicit metrics not present
+                if ((hrms_msg is None) or (vrms_msg is None)) and isinstance(covariance, list) and len(covariance) >= 3:
                     try:
                         hrms = math.sqrt(abs(float(covariance[0])))
                         vrms = math.sqrt(abs(float(covariance[2])))
-                        current_state.hrms = f"{hrms:.3f}"
-                        current_state.vrms = f"{vrms:.3f}"
+                        # Only overwrite if not already set by explicit fields
+                        if hrms_msg is None:
+                            current_state.hrms = f"{hrms:.3f}"
+                        if vrms_msg is None:
+                            current_state.vrms = f"{vrms:.3f}"
                     except Exception:
                         current_state.hrms = current_state.hrms or '0.000'
                         current_state.vrms = current_state.vrms or '0.000'
+
                 current_state.last_update = time.time()
             schedule_fast_emit()
+
+        elif msg_type == "estimator_status":
+            # Bridge publishes a normalized 'imu_aligned' boolean when available
+            imu_aligned = message.get('imu_aligned')
+            if isinstance(imu_aligned, bool):
+                with mavros_telem_lock:
+                    new_status = 'ALIGNED' if imu_aligned else 'UNALIGNED'
+                    if current_state.imu_status != new_status:
+                        current_state.imu_status = new_status
+                        current_state.last_update = time.time()
+                schedule_fast_emit()
+
+        elif msg_type == 'imu':
+            # Store last IMU sample (orientation / angular velocity / linear acc)
+            imu_payload = message.get('imu')
+            if isinstance(imu_payload, dict):
+                with mavros_telem_lock:
+                    current_state.imu = imu_payload
+                    current_state.last_update = time.time()
+                schedule_fast_emit()
 
         elif msg_type == "heading":
             heading = message.get("heading")
@@ -1152,11 +1485,119 @@ def _handle_mavros_telemetry(message: dict) -> None:
                     current_state.last_update = time.time()
             schedule_fast_emit()
 
-        elif msg_type == "battery":
-            percentage = message.get("percentage")
-            if percentage is not None:
+        elif msg_type == "velocity":
+            # Velocity messages published by MAVROS bridge may include a 'groundspeed' key.
+            gs = message.get('groundspeed')
+            if gs is not None:
+                try:
+                    with mavros_telem_lock:
+                        current_state.groundspeed = float(gs)
+                        current_state.last_update = time.time()
+                except Exception:
+                    pass
+                schedule_fast_emit()
+
+        elif msg_type == "rtk_baseline":
+            # Baseline vectors from RTK base (broadcast by MAVROS bridge)
+            baseline = message.get('rtk_baseline') or message
+            print(f"[DEBUG] rtk_baseline handler: message keys={list(message.keys())}, baseline type={type(baseline)}", flush=True)
+            try:
                 with mavros_telem_lock:
-                    current_state.battery = max(0, int(round(float(percentage) * 100))) if percentage <= 1.0 else int(round(float(percentage)))
+                    current_state.rtk_baseline = dict(baseline) if isinstance(baseline, dict) else None
+                    current_state.rtk_baseline_ts = time.time()
+                    # Reset/initialize baseline_age to zero on receipt
+                    current_state.rtk_baseline_age = 0.0
+                    print(f"[DEBUG] Stored rtk_baseline: {current_state.rtk_baseline is not None}, ts={current_state.rtk_baseline_ts}", flush=True)
+
+                    # Heuristic for base_linked: explicit field, or use iar_num_hypotheses==1 or small accuracy
+                    base_linked = None
+                    if isinstance(baseline, dict):
+                        if 'base_linked' in baseline and isinstance(baseline.get('base_linked'), bool):
+                            base_linked = bool(baseline.get('base_linked'))
+                        else:
+                            iar = baseline.get('iar_num_hypotheses')
+                            acc = baseline.get('accuracy')
+                            try:
+                                if iar is not None and int(iar) == 1:
+                                    base_linked = True
+                                elif acc is not None:
+                                    # accuracy in meters: consider very small accuracy as linked
+                                    if float(acc) <= 0.05:
+                                        base_linked = True
+                                    else:
+                                        base_linked = False
+                            except Exception:
+                                base_linked = None
+
+                    if isinstance(base_linked, bool):
+                        current_state.rtk_base_linked = base_linked
+                        try:
+                            log_message(f"[RTK] rtk_baseline received, setting rtk_base_linked={base_linked}", 'DEBUG')
+                        except Exception:
+                            pass
+                    else:
+                        # Fallback: infer from rtk_fix_type if available
+                        try:
+                            current_state.rtk_base_linked = (current_state.rtk_fix_type >= 5)
+                            try:
+                                log_message(f"[RTK] rtk_baseline received, inferred rtk_base_linked from fix_type: {current_state.rtk_base_linked}", 'DEBUG')
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                    current_state.last_update = time.time()
+            except Exception:
+                pass
+            schedule_fast_emit()
+
+        elif msg_type == "battery":
+            # Accept either 'percentage' (fraction 0.0-1.0 or 0-100) or 'battery' (already percent)
+            perc_value = message.get("percentage")
+            if perc_value is None:
+                perc_value = message.get("battery")
+            volt_value = message.get("voltage")
+            curr_value = message.get("current")
+
+            try:
+                log_message(f"Battery telem received: perc={perc_value}, volt={volt_value}, curr={curr_value}, keys={list(message.keys())}", 'DEBUG', event_type='ros_topic')
+            except Exception:
+                pass
+
+            updated = False
+            if perc_value is not None:
+                with mavros_telem_lock:
+                    try:
+                        pctf = float(perc_value)
+                        # Check for NaN or invalid values
+                        import math
+                        if not math.isnan(pctf) and not math.isinf(pctf):
+                            pct_val = max(0, int(round(pctf * 100))) if pctf <= 1.0 else max(0, int(round(pctf)))
+                            if current_state.battery != pct_val:
+                                current_state.battery = pct_val
+                                updated = True
+                    except Exception:
+                        pass
+
+            # Optionally store voltage/current for future UI use
+            with mavros_telem_lock:
+                try:
+                    if volt_value is not None:
+                        v = float(volt_value)
+                        if not math.isnan(v) and not math.isinf(v):
+                            current_state.voltage = v  # type: ignore[attr-defined]
+                            updated = True
+                except Exception:
+                    pass
+                try:
+                    if curr_value is not None:
+                        c = float(curr_value)
+                        if not math.isnan(c) and not math.isinf(c):
+                            current_state.current = c  # type: ignore[attr-defined]
+                            updated = True
+                except Exception:
+                    pass
+                if updated:
                     current_state.last_update = time.time()
             schedule_fast_emit()
 
@@ -1195,6 +1636,50 @@ def _handle_mavros_telemetry(message: dict) -> None:
                     current_state.servo_output = servo_state
                     current_state.last_update = time.time()
                 schedule_fast_emit()
+
+        # Fallback: process battery fields even if message type isn't explicitly 'battery'
+        try:
+            perc_value = message.get("percentage")
+            if perc_value is None:
+                perc_value = message.get("battery")
+            volt_value = message.get("voltage")
+            curr_value = message.get("current")
+            updated = False
+            if perc_value is not None:
+                with mavros_telem_lock:
+                    try:
+                        pctf = float(perc_value)
+                        import math
+                        if not math.isnan(pctf) and not math.isinf(pctf):
+                            pct_val = max(0, int(round(pctf * 100))) if pctf <= 1.0 else max(0, int(round(pctf)))
+                            if current_state.battery != pct_val:
+                                current_state.battery = pct_val
+                                updated = True
+                    except Exception:
+                        pass
+                
+            with mavros_telem_lock:
+                try:
+                    if volt_value is not None:
+                        v = float(volt_value)
+                        if not math.isnan(v) and not math.isinf(v):
+                            current_state.voltage = v  # type: ignore[attr-defined]
+                            updated = True
+                except Exception:
+                    pass
+                try:
+                    if curr_value is not None:
+                        c = float(curr_value)
+                        if not math.isnan(c) and not math.isinf(c):
+                            current_state.current = c  # type: ignore[attr-defined]
+                            updated = True
+                except Exception:
+                    pass
+                if updated:
+                    current_state.last_update = time.time()
+                    schedule_fast_emit()
+        except Exception:
+            pass
 
     except Exception as exc:
         log_message(f"MAVROS telemetry handler error: {exc}", "ERROR")
@@ -1363,6 +1848,15 @@ def _handle_upload_mission(data):
     if not isinstance(waypoints, list) or not waypoints:
         raise ValueError("Mission upload requires waypoints")
     
+    # Validate coordinates before upload to catch any lat/lng swap issues
+    for wp in waypoints:
+        lat_val = wp.get('lat', 0)
+        lng_val = wp.get('lng', 0)
+        if abs(lat_val) > 90:
+            raise ValueError(f"Invalid latitude {lat_val} in waypoint {wp.get('id', '?')} - must be between -90 and +90")
+        if abs(lng_val) > 180:
+            raise ValueError(f"Invalid longitude {lng_val} in waypoint {wp.get('id', '?')} - must be between -180 and +180")
+    
     # Apply servo configuration if provided
     servo_config = data.get("servoConfig")
     if servo_config:
@@ -1423,6 +1917,15 @@ def _handle_get_mission(data):
                 'message': 'Rover mission is empty (0 waypoints)',
                 'waypoints': []
             }
+        
+        # Validate coordinates to catch any lat/lng swap issues
+        for wp in mission_waypoints:
+            lat_val = wp.get('lat', 0)
+            lng_val = wp.get('lng', 0)
+            if abs(lat_val) > 90:
+                log_message(f"WARNING: Invalid latitude {lat_val} in waypoint {wp.get('id')} - possible lat/lng swap!", "ERROR")
+            if abs(lng_val) > 180:
+                log_message(f"WARNING: Invalid longitude {lng_val} in waypoint {wp.get('id')} - possible lat/lng swap!", "ERROR")
         
         log_message(f"[MISSION] Successfully downloaded {len(mission_waypoints)} waypoints", "SUCCESS")
         return {
@@ -1885,17 +2388,39 @@ def handle_disconnect_caster():
 @socketio.on('connect')
 def handle_connect():
     """Handles a new client connection."""
-    log_message('Client connected')
-    if is_vehicle_connected:
-        log_message("Emitting 'CONNECTED_TO_ROVER' to NEW client...")
-        emit('connection_status', {'status': 'CONNECTED_TO_ROVER'})
-        rover_data = get_rover_data()
-        if rover_data:
-            log_message("Sending current rover data to new client")
-            emit('rover_data', rover_data)
-    else:
-        log_message("Emitting 'WAITING_FOR_ROVER' to NEW client...")
-        emit('connection_status', {'status': 'WAITING_FOR_ROVER'})
+    try:
+        client_id = request.sid
+        client_addr = request.remote_addr
+        log_message(f'✅ Client connected: {client_id} from {client_addr}', 'INFO')
+        
+        # Send connection confirmation with session ID
+        emit('connection_response', {
+            'status': 'connected',
+            'sid': client_id,
+            'timestamp': time.time()
+        })
+        
+        if is_vehicle_connected:
+            log_message("Emitting 'CONNECTED_TO_ROVER' to NEW client...")
+            emit('connection_status', {'status': 'CONNECTED_TO_ROVER'})
+            rover_data = get_rover_data()
+            if rover_data:
+                log_message("Sending current rover data to new client")
+                emit('rover_data', rover_data)
+        else:
+            log_message("Emitting 'WAITING_FOR_ROVER' to NEW client...")
+            emit('connection_status', {'status': 'WAITING_FOR_ROVER'})
+    except Exception as e:
+        # Do not reject the connection if our handler has a transient error
+        log_message(f"Error in connect handler: {e}", 'ERROR')
+        try:
+            emit('connection_response', {
+                'status': 'connected',
+                'sid': request.sid if hasattr(request, 'sid') else None,
+                'timestamp': time.time()
+            })
+        except Exception:
+            pass
 
     # Also inform new clients of current RTK caster status for seamless UX
     try:
@@ -1919,7 +2444,16 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    log_message('Client disconnected')
+    client_id = request.sid
+    log_message(f'❌ Client disconnected: {client_id}', 'INFO')
+
+
+@socketio.on('ping')
+def handle_ping():
+    """Handle ping from client for connection testing."""
+    client_id = request.sid
+    log_message(f'📡 Ping from {client_id}', 'DEBUG')
+    emit('pong', {'timestamp': time.time()})
 
 
 @socketio.on('request_rover_reconnect')
@@ -1975,6 +2509,7 @@ def handle_command(data):
     )
 
     handler = COMMAND_HANDLERS.get(command_type)
+# ---------------------------------------------------------------------------
     if not handler:
         log_message(f"Unknown command: {command_type}", "ERROR", event_type='ui_request')
         payload = {
@@ -2028,6 +2563,94 @@ def handle_command(data):
             event_type='server_response',
             meta=_make_json_safe(payload)
         )
+
+# ---------------------------------------------------------------------------
+# Testing / dev helpers
+# ---------------------------------------------------------------------------
+@socketio.on('inject_mavros_telemetry')
+def handle_inject_mavros_telemetry(data):
+    """Inject a MAVROS-like telemetry payload into the server for testing.
+
+    Use with care: this is intended for local testing only (development).
+    Emits a short ack and triggers the usual telemetry merge/emit path.
+    """
+    try:
+        # Accept either full envelope or a partial payload
+        _handle_mavros_telemetry(data)
+        emit('inject_ack', {'status': 'ok'})
+    except Exception as exc:
+        log_message(f"inject_mavros_telemetry failed: {exc}", 'ERROR')
+        try:
+            emit('inject_ack', {'status': 'error', 'error': str(exc)})
+        except Exception:
+            pass
+
+
+# ============================================================================
+# ROOT & HEALTH ENDPOINTS
+# ============================================================================
+
+@app.route('/')
+def root():
+    """Root endpoint - returns server status and available endpoints."""
+    return jsonify({
+        'status': 'online',
+        'message': 'NRP Rover Backend Server',
+        'version': '1.0',
+        'ros_available': ROS_AVAILABLE,
+        'endpoints': {
+            'health': '/api/health',
+            'rover_data': '/api/rover-data',
+            'servo_control': '/api/servo/control',
+            'servo_status': '/servo/status',
+            'rtk_status': '/api/rtk/status',
+            'mission_upload': '/api/mission/upload',
+            'mission_download': '/api/mission/download',
+            'arm_vehicle': '/api/arm',
+            'set_mode': '/api/set-mode'
+        }
+    }), 200
+
+
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint - returns backend health status."""
+    try:
+        # Check ROS connection status
+        ros_status = 'connected' if ROS_AVAILABLE else 'unavailable'
+        
+        # Check MAVROS bridge status
+        mavros_connected = False
+        if telemetry_bridge:
+            try:
+                mavros_connected = telemetry_bridge.is_connected()
+            except Exception:
+                pass
+        
+        # Build health response
+        health_data = {
+            'success': True,
+            'status': 'healthy',
+            'timestamp': time.time(),
+            'services': {
+                'ros': ros_status,
+                'mavros': 'connected' if mavros_connected else 'disconnected',
+                'servo': 'available',
+                'rtk': 'available'
+            },
+            'uptime': time.time()
+        }
+        
+        return jsonify(health_data), 200
+        
+    except Exception as e:
+        app.logger.error(f"Health check error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': time.time()
+        }), 500
 
 
 # ============================================================================
@@ -2521,10 +3144,32 @@ def default_error_handler(e):
     log_message(f"SocketIO error: {e}", "ERROR")
 
 
+@app.errorhandler(404)
+def handle_404(e):
+    """Handle 404 Not Found errors with proper JSON response."""
+    app.logger.warning(f"404 Not Found: {request.path}")
+    return jsonify({
+        'success': False,
+        'error': '404 Not Found',
+        'message': f'The requested endpoint {request.path} does not exist',
+        'path': request.path
+    }), 404
+
+
 @app.errorhandler(Exception)
 def handle_exception(e):
-    log_message(f"Flask error: {e}", "ERROR")
-    return {'error': str(e)}, 500
+    """Handle all unhandled exceptions with proper JSON response."""
+    app.logger.error(f"Flask error: {str(e)}", exc_info=True)
+    
+    # Don't leak internal error details in production
+    error_message = str(e)
+    error_type = type(e).__name__
+    
+    return jsonify({
+        'success': False,
+        'error': error_message,
+        'type': error_type
+    }), 500
 
 
 # ============================================================================
@@ -2640,7 +3285,8 @@ def servo_run():
 
     p = _subprocess.Popen(
         ["python3", os.path.join(SERVO_BASE, scripts[mode])],
-        stdout=log_file, stderr=_subprocess.STDOUT
+        stdout=log_file, stderr=_subprocess.STDOUT,
+        cwd=SERVO_BASE
     )
     _running[mode] = {"pid": p.pid, "log": log_path, "start": time.time()}
     return jsonify({"status": f"{mode} started", "pid": p.pid, "log": log_path})
@@ -2658,13 +3304,62 @@ def servo_stop():
     return jsonify({"status": f"{mode} stopped"})
 
 
+@app.post("/servo/emergency_stop")
+def servo_emergency_stop():
+    """
+    Emergency stop all running servo scripts immediately.
+    
+    Returns:
+    {
+        "status": "emergency stop initiated",
+        "stopped_modes": ["mode1", "mode2", ...]
+    }
+    """
+    stopped_modes = []
+    for mode in list(_running.keys()):
+        try:
+            _kill_mode(mode)
+            stopped_modes.append(mode)
+        except Exception as e:
+            # Log error but continue stopping other modes
+            print(f"Error stopping {mode}: {e}")
+    
+    return jsonify({
+        "status": "emergency stop initiated",
+        "stopped_modes": stopped_modes
+    })
+
+
 @app.get("/servo/status")
 def servo_status():
+    """
+    Return servo status including running servo scripts and current servo output telemetry.
+    
+    Returns:
+    {
+        "success": true,
+        "active": bool,           // Any servo script is running
+        "running_modes": {...},   // Active servo scripts (wpmark, continuous, etc.)
+        "servo_output": {...}     // Current PWM values from MAVROS telemetry
+    }
+    """
     _cleanup_running()
     for m, info in list(_running.items()):
         alive = _is_pid_alive(info.get("pid"))
         info["running"] = bool(alive)
-    return jsonify(_running)
+    
+    # Get current servo telemetry from MAVROS
+    servo_telemetry = {}
+    if current_state.servo_output:
+        servo_telemetry = current_state.servo_output
+    
+    return jsonify({
+        "success": True,
+        "active": len(_running) > 0,
+        "running_modes": _running,
+        "servo_output": servo_telemetry,
+        "timestamp": time.time()
+    })
 
 
 @app.get("/servo/edit")

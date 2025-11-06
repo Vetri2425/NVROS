@@ -62,6 +62,9 @@ class MavrosBridge:
         self._state_topic: Optional[roslibpy.Topic] = None
         self._navsat_topic: Optional[roslibpy.Topic] = None
         self._gps_fix_topic: Optional[roslibpy.Topic] = None
+        self._estimator_topic: Optional[roslibpy.Topic] = None
+        self._imu_topic: Optional[roslibpy.Topic] = None
+        self._rtk_baseline_topic: Optional[roslibpy.Topic] = None
         self._heading_topic: Optional[roslibpy.Topic] = None
         self._battery_topic: Optional[roslibpy.Topic] = None
         self._mission_topic: Optional[roslibpy.Topic] = None
@@ -354,9 +357,18 @@ class MavrosBridge:
         self._state_topic = roslibpy.Topic(self._ros, "/mavros/state", "mavros_msgs/State")
         
         # Position and navigation
-        self._navsat_topic = roslibpy.Topic(self._ros, "/mavros/global_position/global", "sensor_msgs/NavSatFix")
-        self._gps_fix_topic = roslibpy.Topic(self._ros, "/mavros/global_position/raw/fix", "sensor_msgs/NavSatFix")
+        # PRIMARY GPS SOURCE: Use raw GPS data (contains correct altitude and RTK status)
+        self._gps_raw_topic = roslibpy.Topic(self._ros, "/mavros/gpsstatus/gps1/raw", "mavros_msgs/GPSRAW")
+        
+        # DEPRECATED: Old topics kept for compatibility (have MAVROS bugs)
+        # self._navsat_topic = roslibpy.Topic(self._ros, "/mavros/global_position/global_corrected", "sensor_msgs/NavSatFix")
+        # self._gps_fix_topic = roslibpy.Topic(self._ros, "/mavros/global_position/raw/fix", "sensor_msgs/NavSatFix")
+        
+        self._rtk_baseline_topic = roslibpy.Topic(self._ros, "/mavros/gps_rtk/rtk_baseline", "mavros_msgs/RTKBaseline")
         self._heading_topic = roslibpy.Topic(self._ros, "/mavros/global_position/compass_hdg", "std_msgs/Float64")
+        # Estimator / IMU topics (alignment & raw IMU data)
+        self._estimator_topic = roslibpy.Topic(self._ros, "/mavros/estimator_status", "mavros_msgs/EstimatorStatus")
+        self._imu_topic = roslibpy.Topic(self._ros, "/mavros/imu/data", "sensor_msgs/Imu")
         self._velocity_topic = roslibpy.Topic(self._ros, "/mavros/global_position/raw/gps_vel", "geometry_msgs/TwistStamped")
         
         # System status
@@ -376,9 +388,21 @@ class MavrosBridge:
 
         # Subscribe to all topics
         self._state_topic.subscribe(self._handle_state)
-        self._navsat_topic.subscribe(self._handle_navsat)
-        self._gps_fix_topic.subscribe(self._handle_gps_fix)
+        self._gps_raw_topic.subscribe(self._handle_gps_raw)  # Primary GPS source
+        # self._navsat_topic.subscribe(self._handle_navsat)  # DEPRECATED
+        # self._gps_fix_topic.subscribe(self._handle_gps_fix)  # DEPRECATED
+        self._rtk_baseline_topic.subscribe(self._handle_rtk_baseline)
         self._heading_topic.subscribe(self._handle_heading)
+        # Subscribe to estimator and IMU topics to expose alignment and raw IMU to the backend
+        try:
+            self._estimator_topic.subscribe(self._handle_estimator_status)
+        except Exception:
+            # Best-effort: some systems may not publish estimator_status
+            pass
+        try:
+            self._imu_topic.subscribe(self._handle_imu_data)
+        except Exception:
+            pass
         self._velocity_topic.subscribe(self._handle_velocity)
         self._battery_topic.subscribe(self._handle_battery)
         self._sys_status_topic.subscribe(self._handle_sys_status)
@@ -403,12 +427,107 @@ class MavrosBridge:
             "connected": connected
         }, message_type="state")
 
-    def _handle_navsat(self, message: Dict[str, Any]) -> None:
-        """Handle global position updates."""
+    def _handle_gps_raw(self, message: Dict[str, Any]) -> None:
+        """Handle raw GPS data from /mavros/gpsstatus/gps1/raw.
+        
+        This topic provides CORRECT data (unlike buggy NavSatFix topics):
+        - fix_type: 0-6 where 6=RTK Fixed, 5=RTK Float, 4=DGPS, etc.
+        - lat/lon: in 1e7 format (degrees * 10000000)
+        - alt: in millimeters (AMSL altitude)
+        - eph/epv: horizontal/vertical accuracy in centimeters
+        - satellites_visible: actual satellite count
+        
+        Example raw message:
+        {
+            "fix_type": 6,
+            "lat": 130720581,
+            "lon": 802619324,
+            "alt": 16610,
+            "eph": 70,
+            "epv": 120,
+            "satellites_visible": 29,
+            "vel": 0,
+            "cog": 18000
+        }
+        """
+        # Extract and convert position data
+        lat_raw = int(message.get("lat", 0))
+        lon_raw = int(message.get("lon", 0))
+        alt_mm = int(message.get("alt", 0))
+        
+        # Convert to standard units
+        lat = lat_raw / 1e7  # degrees
+        lon = lon_raw / 1e7  # degrees
+        alt = alt_mm / 1000.0  # meters (AMSL)
+        
+        # Extract accuracy data
+        eph_cm = int(message.get("eph", 0))
+        epv_cm = int(message.get("epv", 0))
+        eph = eph_cm / 100.0  # meters (horizontal accuracy)
+        epv = epv_cm / 100.0  # meters (vertical accuracy)
+        
+        # Extract fix quality
+        fix_type = int(message.get("fix_type", 0))
+        satellites_visible = int(message.get("satellites_visible", 0))
+        
+        # Extract velocity and course
+        vel_cm_s = int(message.get("vel", 0))
+        vel = vel_cm_s / 100.0  # m/s
+        cog_cdeg = int(message.get("cog", 0))
+        cog = cog_cdeg / 100.0  # degrees
+        
+        # Map fix type to RTK status string
+        rtk_status_map = {
+            0: "No Fix",
+            1: "No Fix",
+            2: "2D Fix",
+            3: "3D Fix",
+            4: "DGPS",
+            5: "RTK Float",
+            6: "RTK Fixed"
+        }
+        rtk_status = rtk_status_map.get(fix_type, "Unknown")
+        
+        # DEBUG: Log GPS updates
+        print(f"[MAVROS_BRIDGE] GPS RAW: lat={lat:.7f}, lon={lon:.7f}, alt={alt:.2f}m, "
+              f"fix={fix_type} ({rtk_status}), sats={satellites_visible}, eph={eph:.2f}m", flush=True)
+        
+        # Broadcast position data (replaces _handle_navsat)
         self._broadcast_telem({
-            "latitude": float(message.get("latitude", 0.0)),
-            "longitude": float(message.get("longitude", 0.0)),
-            "altitude": float(message.get("altitude", 0.0)),
+            "latitude": lat,
+            "longitude": lon,
+            "altitude": alt,
+            "relative_altitude": 0.0  # Not available in raw GPS
+        }, message_type="navsat")
+        
+        # Broadcast GPS fix quality (replaces _handle_gps_fix)
+        self._broadcast_telem({
+            "rtk_status": rtk_status,
+            "fix_type": fix_type,
+            "satellites_visible": satellites_visible,
+            "hrms": eph,  # horizontal RMS accuracy
+            "vrms": epv,  # vertical RMS accuracy
+            "velocity": vel,
+            "course": cog
+        }, message_type="gps_fix")
+
+    def _handle_navsat(self, message: Dict[str, Any]) -> None:
+        """Handle global position updates.
+        
+        Now using /mavros/global_position/global_corrected topic which is
+        corrected by gps_altitude_corrector.py node (+92.2m fix applied at ROS level).
+        """
+        lat = float(message.get("latitude", 0.0))
+        lon = float(message.get("longitude", 0.0))
+        alt = float(message.get("altitude", 0.0))  # Already corrected by ROS node
+        
+        # DEBUG: Log GPS updates
+        print(f"[MAVROS_BRIDGE] GPS Update: lat={lat:.7f}, lon={lon:.7f}, alt={alt:.2f}", flush=True)
+        
+        self._broadcast_telem({
+            "latitude": lat,
+            "longitude": lon,
+            "altitude": alt,
             "relative_altitude": float(message.get("relative_altitude", 0.0))
         }, message_type="navsat")
 
@@ -438,6 +557,48 @@ class MavrosBridge:
             "hrms": hrms
         }, message_type="gps_fix")
 
+    def _handle_rtk_baseline(self, message: Dict[str, Any]) -> None:
+        """Handle RTK baseline updates (distance from base station)."""
+        # Debug log raw baseline message for diagnostics
+        try:
+            print(f"[MAVROS_BRIDGE] Received rtk_baseline message: {message}", flush=True)
+        except Exception:
+            pass
+        # Extract baseline vectors (in meters from base station)
+        baseline_a = message.get("baseline_a_mm", 0) / 1000.0  # Convert mm to meters
+        baseline_b = message.get("baseline_b_mm", 0) / 1000.0
+        baseline_c = message.get("baseline_c_mm", 0) / 1000.0
+        
+        # Calculate total baseline distance
+        baseline_distance = (baseline_a**2 + baseline_b**2 + baseline_c**2) ** 0.5
+        
+        # Extract accuracy information
+        accuracy = message.get("accuracy", 0)
+        iar_num_hypotheses = message.get("iar_num_hypotheses", 0)
+        
+        # Extract time of week
+        tow = message.get("tow", 0)
+        rtk_receiver_id = message.get("rtk_receiver_id", 0)
+        rtk_health = message.get("rtk_health", 0)
+        rtk_rate = message.get("rtk_rate", 0)
+        nsats = message.get("nsats", 0)
+        
+        self._broadcast_telem({
+            "rtk_baseline": {
+                "baseline_a_mm": baseline_a * 1000,  # Keep original mm values
+                "baseline_b_mm": baseline_b * 1000,
+                "baseline_c_mm": baseline_c * 1000,
+                "baseline_distance": baseline_distance,  # Total distance in meters
+                "accuracy": accuracy,
+                "iar_num_hypotheses": iar_num_hypotheses,
+                "tow": tow,
+                "rtk_receiver_id": rtk_receiver_id,
+                "rtk_health": rtk_health,
+                "rtk_rate": rtk_rate,
+                "nsats": nsats
+            }
+        }, message_type="rtk_baseline")
+
     def _handle_heading(self, message: Dict[str, Any]) -> None:
         """Handle compass heading updates."""
         self._broadcast_telem({
@@ -446,12 +607,87 @@ class MavrosBridge:
 
     def _handle_battery(self, message: Dict[str, Any]) -> None:
         """Handle battery status updates."""
-        percentage = float(message.get("percentage", -1.0)) * 100  # Convert to percentage
+        try:
+            raw_pct = message.get("percentage", None)
+            raw_volt = message.get("voltage", None)
+            raw_curr = message.get("current", None)
+            print(f"[MAVROS_BRIDGE] Battery msg: percentage={raw_pct}, voltage={raw_volt}, current={raw_curr}", flush=True)
+
+            pct = float(raw_pct) if raw_pct is not None else -1.0
+            import math
+            if math.isnan(pct) or math.isinf(pct):
+                # Skip invalid metrics
+                return
+            percentage = pct * 100.0  # Convert to percentage scale
+
+            voltage = float(raw_volt) if raw_volt is not None else 0.0
+            current = float(raw_curr) if raw_curr is not None else 0.0
+            self._broadcast_telem({
+                "battery": percentage,
+                "voltage": voltage,
+                "current": current
+            }, message_type="battery")
+            print(f"[MAVROS_BRIDGE] Battery broadcast: battery={percentage:.2f}%, voltage={voltage}, current={current}", flush=True)
+        except Exception as e:
+            # Never crash on telemetry
+            print(f"[MAVROS_BRIDGE] Battery handler error: {e}", flush=True)
+
+    def _handle_estimator_status(self, message: Dict[str, Any]) -> None:
+        """Handle estimator status updates and expose IMU alignment state.
+
+        The exact field naming can vary by autopilot/driver. Try a few common
+        keys and fall back to a conservative default (unaligned).
+        """
+        aligned = None
+        try:
+            # Common field names from various stacks
+            if 'aligned' in message:
+                aligned = bool(message.get('aligned'))
+            elif 'attitude_aligned' in message:
+                aligned = bool(message.get('attitude_aligned'))
+            elif isinstance(message.get('status'), dict) and 'attitude_aligned' in message.get('status'):
+                aligned = bool(message.get('status', {}).get('attitude_aligned'))
+            # Some messages provide numeric flags; try a simple bit-check fallback
+            elif 'flags' in message:
+                try:
+                    flags = int(message.get('flags', 0))
+                    aligned = bool(flags & 0x01)
+                except Exception:
+                    aligned = None
+        except Exception:
+            aligned = None
+
+        if aligned is None:
+            aligned = False
+
+        # Broadcast a small payload for server to merge
         self._broadcast_telem({
-            "battery": percentage,
-            "voltage": float(message.get("voltage", 0.0)),
-            "current": float(message.get("current", 0.0))
-        }, message_type="battery")
+            'imu_aligned': bool(aligned)
+        }, message_type='estimator_status')
+
+    def _handle_imu_data(self, message: Dict[str, Any]) -> None:
+        """Expose raw IMU fields (orientation/ang vel/linear acc) to the backend.
+
+        Avoid publishing large nested structures frequently; only include the
+        main numeric groups so the frontend can display an 'IMU' value if
+        desired.
+        """
+        try:
+            orientation = message.get('orientation')
+            angular_velocity = message.get('angular_velocity') or message.get('angular_velocity', {})
+            linear_acceleration = message.get('linear_acceleration') or message.get('linear_acceleration', {})
+
+            payload = {
+                'imu': {
+                    'orientation': orientation,
+                    'angular_velocity': angular_velocity,
+                    'linear_acceleration': linear_acceleration
+                }
+            }
+            self._broadcast_telem(payload, message_type='imu')
+        except Exception:
+            # best-effort
+            pass
 
     def _handle_sys_status(self, message: Dict[str, Any]) -> None:
         """Handle system status updates."""

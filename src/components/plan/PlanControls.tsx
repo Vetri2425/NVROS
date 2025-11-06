@@ -235,6 +235,18 @@ const PlanControls: React.FC<PlanControlsProps> = ({
               💾 Export Mission
             </button>
 
+            <button
+              onClick={onClearMission}
+              disabled={missionWaypoints.length === 0}
+              className={`w-full px-4 py-2 rounded-md transition-all duration-200 text-sm font-medium ${
+                missionWaypoints.length > 0
+                  ? 'bg-red-600 hover:bg-red-700 text-white'
+                  : 'bg-gray-500 text-gray-300 cursor-not-allowed'
+              }`}
+            >
+              🗑️ Remove Mission
+            </button>
+
             {currentFile && (
               <div className="bg-slate-700 p-2 mt-3 rounded text-xs text-slate-300">
                 <div>

@@ -1,0 +1,22 @@
+{
+  "wp_mark": {
+    "enabled": true,
+    "version": "1.0.0",
+    "parameters": {
+      "delay_before_start": 2.0,
+      "pwm_start": 1500,
+      "delay_before_stop": 5.0,
+      "pwm_stop": 1000,
+      "delay_after_stop": 1.0,
+      "servo_channel": 10
+    },
+    "settings": {
+      "servo_channel": 10,
+      "waypoint_arrival_threshold": 2.0,
+      "waypoint_timeout": 300.0,
+      "gps_fix_required": 3,
+      "log_enabled": true
+    },
+    "last_updated": "2025-11-05T00:00:00Z"
+  }
+}

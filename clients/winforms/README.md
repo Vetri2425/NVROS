@@ -11,7 +11,7 @@ Prerequisites
 Configure
 - Backend URL via environment variable (recommended):
   - `JETSON_BACKEND_URL=http://<backend-host>:5000`
-  - Defaults to `http://192.168.1.20:5000` if not set.
+  - Defaults to `http://192.168.1.100:5000` if not set.
 
 Build & Run
 1. Open a Developer PowerShell/Command Prompt in `clients/winforms`
