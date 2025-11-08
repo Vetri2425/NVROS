@@ -8,7 +8,7 @@ type Props = {
   onRefresh?: () => void;
 };
 
-export default function ConfigEditor({ selectedMode, JETSON_API, status, onRefresh }: Props) {
+export default function ConfigEditor({ selectedMode, JETSON_API, status, onRefresh }: any) {
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [restarting, setRestarting] = useState(false);

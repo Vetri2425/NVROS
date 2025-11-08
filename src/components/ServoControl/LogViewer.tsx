@@ -1,7 +1,7 @@
 // src/components/ServoControl/LogViewer.tsx
 import React, { useEffect } from "react";
 
-export default function LogViewer({ status, JETSON_API, logText, setLogText }: any) {
+export default function LogViewer({ status, JETSON_API, logText, setLogText, selectedMode, onRefresh }: any) {
   const fetchLogs = async () => {
     try {
       // pick the first running mode
@@ -19,12 +19,13 @@ export default function LogViewer({ status, JETSON_API, logText, setLogText }: a
   };
 
   useEffect(() => {
-    const timer = setInterval(fetchLogs, 2000);
+    const timer = setInterval(fetchLogs, 500); // 2 Hz update rate
     return () => clearInterval(timer);
   }, [status]);
 
   const handleClearConsole = () => {
     setLogText("");
+    if (onRefresh) onRefresh(); // Refresh status after clearing
   };
 
   return (

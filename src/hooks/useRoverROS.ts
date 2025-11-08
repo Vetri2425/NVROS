@@ -36,6 +36,13 @@ const SOCKET_OPTIONS: Partial<ManagerOptions & SocketOptions> = {
   reconnectionDelay: 1000,
   reconnectionDelayMax: 5000,
   timeout: 20000,
+  // Add connection upgrade settings for better reliability
+  upgrade: true,
+  rememberUpgrade: true,
+  // Force new connection on reconnect to avoid stale state
+  forceNew: false,
+  // Enable multiplexing
+  multiplex: true,
 };
 
 const API_BASE = `${DEFAULT_HTTP_BASE}/api`;
@@ -100,18 +107,45 @@ const createDefaultTelemetry = (): RoverTelemetry => ({
 });
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-    ...init,
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Request failed (${response.status}): ${text}`);
+  const maxRetries = 3;
+  const retryDelay = 1000;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await fetch(path, {
+        headers: {
+          'Content-Type': 'application/json',
+          ...(init?.headers ?? {}),
+        },
+        ...init,
+      });
+      
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        
+        // Retry on server errors (5xx) or network issues
+        if (response.status >= 500 && attempt < maxRetries - 1) {
+          console.warn(`Request failed (${response.status}), retrying in ${retryDelay}ms (attempt ${attempt + 1}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay * (attempt + 1)));
+          continue;
+        }
+        
+        throw new Error(`Request failed (${response.status}): ${text}`);
+      }
+      
+      return (await response.json()) as T;
+    } catch (error) {
+      // Retry on network errors
+      if (attempt < maxRetries - 1 && (error instanceof TypeError || (error as any).message?.includes('fetch'))) {
+        console.warn(`Network error, retrying in ${retryDelay}ms (attempt ${attempt + 1}/${maxRetries})`, error);
+        await new Promise(resolve => setTimeout(resolve, retryDelay * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
   }
-  return (await response.json()) as T;
+  
+  throw new Error('Request failed after maximum retries');
 }
 
 async function postService(path: string, body?: Record<string, unknown>): Promise<ServiceResponse> {
@@ -381,16 +415,27 @@ export interface UseRoverROSResult {
   reconnect: () => void;
   services: RoverServices;
   setMissionEventHandler: (handler: ((event: MissionEventPayload) => void) | null) => void;
+  connectionQuality?: {
+    latency: number;
+    quality: 'excellent' | 'good' | 'fair' | 'poor';
+    lastPingTime: number;
+  };
 }
 
 export function useRoverROS(): UseRoverROSResult {
   const [telemetrySnapshot, setTelemetrySnapshot] = useState<RoverTelemetry>(createDefaultTelemetry);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
+  const [connectionQuality, setConnectionQuality] = useState<{
+    latency: number;
+    quality: 'excellent' | 'good' | 'fair' | 'poor';
+    lastPingTime: number;
+  }>({ latency: 0, quality: 'good', lastPingTime: Date.now() });
 
   const socketRef = useRef<Socket | null>(null);
   const manualDisconnectRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const backoffRef = useRef<number>(INITIAL_BACKOFF_MS);
+  const pingTimestampRef = useRef<number>(0);
   const connectDelayRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mutableRef = useRef<MutableTelemetry>({
     telemetry: createDefaultTelemetry(),
@@ -566,11 +611,28 @@ export function useRoverROS(): UseRoverROSResult {
           clearReconnectTimer();
           backoffRef.current = INITIAL_BACKOFF_MS;
           setConnectionState('connected');
-          socket.emit('ping');
+          // Send initial ping with timestamp for latency calculation
+          pingTimestampRef.current = Date.now();
+          socket.emit('ping', { client_timestamp: pingTimestampRef.current });
         });
 
-        socket.on('pong', () => {
-          console.log('Received pong from server');
+        socket.on('pong', (data: any) => {
+          const now = Date.now();
+          const latency = data?.client_timestamp ? now - data.client_timestamp : 0;
+          
+          // Update connection quality based on latency
+          let quality: 'excellent' | 'good' | 'fair' | 'poor' = 'excellent';
+          if (latency > 500) quality = 'poor';
+          else if (latency > 200) quality = 'fair';
+          else if (latency > 100) quality = 'good';
+          
+          setConnectionQuality({
+            latency,
+            quality,
+            lastPingTime: now,
+          });
+          
+          console.log(`Pong received - Latency: ${latency}ms, Quality: ${quality}`);
         });
 
         socket.on('connect_error', (error) => {
@@ -625,11 +687,28 @@ export function useRoverROS(): UseRoverROSResult {
         socket.on('rover_data', handleRoverData);
         socket.on('mission_event', handleMissionEvent);
 
+        // Handle server health events
+        socket.on('server_health', (data: any) => {
+          console.log('Server health update:', data);
+        });
+
+        // Handle connection warnings
+        socket.on('connection_warning', (data: any) => {
+          console.warn('Connection warning:', data.message);
+          setConnectionState('error');
+        });
+
+        // Handle connection response with session info
+        socket.on('connection_response', (data: any) => {
+          console.log('Connection confirmed:', data);
+        });
+
         socket.connect();
 
         const pingInterval = setInterval(() => {
           if (socket.connected) {
-            socket.emit('ping');
+            pingTimestampRef.current = Date.now();
+            socket.emit('ping', { client_timestamp: pingTimestampRef.current });
           }
         }, 5000);
 
@@ -746,6 +825,7 @@ const services = useMemo<RoverServices>(
     reconnect,
     services,
     setMissionEventHandler,
+    connectionQuality,
   };
 }
 

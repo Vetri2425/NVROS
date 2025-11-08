@@ -357,12 +357,11 @@ class MavrosBridge:
         self._state_topic = roslibpy.Topic(self._ros, "/mavros/state", "mavros_msgs/State")
         
         # Position and navigation
-        # PRIMARY GPS SOURCE: Use raw GPS data (contains correct altitude and RTK status)
+        # HYBRID APPROACH:
+        # 1) Position (lat/lon/alt): From /mavros/global_position/global_corrected (corrected, lower Hz)
+        # 2) RTK quality: From /mavros/gpsstatus/gps1/raw (fix_type, eph, epv, satellites - 5Hz)
+        self._navsat_topic = roslibpy.Topic(self._ros, "/mavros/global_position/global_corrected", "sensor_msgs/NavSatFix")
         self._gps_raw_topic = roslibpy.Topic(self._ros, "/mavros/gpsstatus/gps1/raw", "mavros_msgs/GPSRAW")
-        
-        # DEPRECATED: Old topics kept for compatibility (have MAVROS bugs)
-        # self._navsat_topic = roslibpy.Topic(self._ros, "/mavros/global_position/global_corrected", "sensor_msgs/NavSatFix")
-        # self._gps_fix_topic = roslibpy.Topic(self._ros, "/mavros/global_position/raw/fix", "sensor_msgs/NavSatFix")
         
         self._rtk_baseline_topic = roslibpy.Topic(self._ros, "/mavros/gps_rtk/rtk_baseline", "mavros_msgs/RTKBaseline")
         self._heading_topic = roslibpy.Topic(self._ros, "/mavros/global_position/compass_hdg", "std_msgs/Float64")
@@ -388,9 +387,8 @@ class MavrosBridge:
 
         # Subscribe to all topics
         self._state_topic.subscribe(self._handle_state)
-        self._gps_raw_topic.subscribe(self._handle_gps_raw)  # Primary GPS source
-        # self._navsat_topic.subscribe(self._handle_navsat)  # DEPRECATED
-        # self._gps_fix_topic.subscribe(self._handle_gps_fix)  # DEPRECATED
+        self._navsat_topic.subscribe(self._handle_navsat)  # Position from global_corrected (corrected altitude)
+        self._gps_raw_topic.subscribe(self._handle_gps_raw)  # RTK quality, eph, epv, satellites (5Hz)
         self._rtk_baseline_topic.subscribe(self._handle_rtk_baseline)
         self._heading_topic.subscribe(self._handle_heading)
         # Subscribe to estimator and IMU topics to expose alignment and raw IMU to the backend
@@ -430,12 +428,13 @@ class MavrosBridge:
     def _handle_gps_raw(self, message: Dict[str, Any]) -> None:
         """Handle raw GPS data from /mavros/gpsstatus/gps1/raw.
         
-        This topic provides CORRECT data (unlike buggy NavSatFix topics):
+        THIS HANDLER PROCESSES RTK QUALITY ONLY (NOT POSITION):
         - fix_type: 0-6 where 6=RTK Fixed, 5=RTK Float, 4=DGPS, etc.
-        - lat/lon: in 1e7 format (degrees * 10000000)
-        - alt: in millimeters (AMSL altitude)
         - eph/epv: horizontal/vertical accuracy in centimeters
         - satellites_visible: actual satellite count
+        
+        Position (lat/lon/alt) comes from /mavros/global_position/global_corrected
+        via _handle_navsat() for better altitude accuracy.
         
         Example raw message:
         {
@@ -450,17 +449,7 @@ class MavrosBridge:
             "cog": 18000
         }
         """
-        # Extract and convert position data
-        lat_raw = int(message.get("lat", 0))
-        lon_raw = int(message.get("lon", 0))
-        alt_mm = int(message.get("alt", 0))
-        
-        # Convert to standard units
-        lat = lat_raw / 1e7  # degrees
-        lon = lon_raw / 1e7  # degrees
-        alt = alt_mm / 1000.0  # meters (AMSL)
-        
-        # Extract accuracy data
+        # Extract accuracy data (in centimeters)
         eph_cm = int(message.get("eph", 0))
         epv_cm = int(message.get("epv", 0))
         eph = eph_cm / 100.0  # meters (horizontal accuracy)
@@ -477,30 +466,25 @@ class MavrosBridge:
         cog = cog_cdeg / 100.0  # degrees
         
         # Map fix type to RTK status string
+        # Based on GPS fix type definitions:
+        # 0: No GPS, 1: No Fix, 2: DGPS, 3: 3D Fix, 4: 3D DGPS, 5: RTK Float, 6: RTK Fixed
         rtk_status_map = {
-            0: "No Fix",
+            0: "No GPS",
             1: "No Fix",
-            2: "2D Fix",
+            2: "DGPS",
             3: "3D Fix",
-            4: "DGPS",
+            4: "3D DGPS",
             5: "RTK Float",
             6: "RTK Fixed"
         }
         rtk_status = rtk_status_map.get(fix_type, "Unknown")
         
-        # DEBUG: Log GPS updates
-        print(f"[MAVROS_BRIDGE] GPS RAW: lat={lat:.7f}, lon={lon:.7f}, alt={alt:.2f}m, "
-              f"fix={fix_type} ({rtk_status}), sats={satellites_visible}, eph={eph:.2f}m", flush=True)
+        # DEBUG: Log GPS quality updates
+        print(f"[MAVROS_BRIDGE] GPS_RAW Quality: fix={fix_type} ({rtk_status}), sats={satellites_visible}, "
+              f"eph={eph:.2f}m, epv={epv:.2f}m, vel={vel:.2f}m/s, cog={cog:.1f}°", flush=True)
         
-        # Broadcast position data (replaces _handle_navsat)
-        self._broadcast_telem({
-            "latitude": lat,
-            "longitude": lon,
-            "altitude": alt,
-            "relative_altitude": 0.0  # Not available in raw GPS
-        }, message_type="navsat")
-        
-        # Broadcast GPS fix quality (replaces _handle_gps_fix)
+        # Broadcast GPS fix quality (RTK status, accuracy metrics, satellites)
+        # NOTE: Position is now handled separately by _handle_navsat() from global_corrected
         self._broadcast_telem({
             "rtk_status": rtk_status,
             "fix_type": fix_type,
@@ -512,23 +496,29 @@ class MavrosBridge:
         }, message_type="gps_fix")
 
     def _handle_navsat(self, message: Dict[str, Any]) -> None:
-        """Handle global position updates.
+        """Handle global position updates from /mavros/global_position/global_corrected.
         
-        Now using /mavros/global_position/global_corrected topic which is
-        corrected by gps_altitude_corrector.py node (+92.2m fix applied at ROS level).
+        Position data source: /mavros/global_position/global_corrected
+        - Provides corrected altitude (+92.2m fix applied by gps_altitude_corrector.py ROS node)
+        - Lower update rate (~1 Hz) but more accurate position
+        - This is the PRIMARY source for rover position coordinates
+        
+        RTK quality metrics (fix_type, eph, epv, satellites) still come from
+        /mavros/gpsstatus/gps1/raw via _handle_gps_raw() at higher frequency (5 Hz).
         """
         lat = float(message.get("latitude", 0.0))
         lon = float(message.get("longitude", 0.0))
-        alt = float(message.get("altitude", 0.0))  # Already corrected by ROS node
+        alt = float(message.get("altitude", 0.0))  # Already corrected by ROS node (+92.2m)
         
-        # DEBUG: Log GPS updates
-        print(f"[MAVROS_BRIDGE] GPS Update: lat={lat:.7f}, lon={lon:.7f}, alt={alt:.2f}", flush=True)
+        # DEBUG: Log position updates from global_corrected
+        print(f"[MAVROS_BRIDGE] NavSat Position: lat={lat:.7f}, lon={lon:.7f}, alt={alt:.2f}m (corrected)", flush=True)
         
+        # Broadcast position data (ONLY position, not RTK quality)
         self._broadcast_telem({
             "latitude": lat,
             "longitude": lon,
             "altitude": alt,
-            "relative_altitude": float(message.get("relative_altitude", 0.0))
+            "relative_altitude": 0.0  # Not available in NavSatFix
         }, message_type="navsat")
 
     def _handle_gps_fix(self, message: Dict[str, Any]) -> None:

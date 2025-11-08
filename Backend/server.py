@@ -79,24 +79,19 @@ def log_response(response):
 
 
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
-                    ping_timeout=60, ping_interval=25)
-
-# Register WP_MARK Blueprint
-try:
-    try:
-        # When running as a package
-        from .servo_manager.wp_mark.api_routes import wp_mark_bp
-    except ImportError:
-        # When running as a script
-        from servo_manager.wp_mark.api_routes import wp_mark_bp
-    
-    app.register_blueprint(wp_mark_bp)
-    print("[INFO] WP_MARK API routes registered successfully", flush=True)
-except Exception as e:
-    print(f"[WARN] Failed to register WP_MARK routes: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='eventlet',
+    ping_timeout=60, 
+    ping_interval=25,
+    engineio_logger=False,
+    logger=False,
+    # Enable more aggressive reconnection handling
+    always_connect=True,
+    # Increase buffer size for better reliability
+    max_http_buffer_size=1e8
+)
 
 ROS_DISTRO = os.environ.get('ROS_DISTRO', 'humble')
 _ros_lib_dir = f"/opt/ros/{ROS_DISTRO}/lib"
@@ -183,6 +178,14 @@ if ROS_AVAILABLE:
                 telemetry_data = json.loads(msg.data)
                 # Removed direct emit of 'telemetry' event to avoid redundant/partial updates
                 # socketio.emit('telemetry', telemetry_data)
+                
+                # Debug: check if function exists
+                import sys
+                if '_merge_ros2_telemetry' not in globals():
+                    print(f"[ERROR] _merge_ros2_telemetry not in globals! Available: {list(globals().keys())[:20]}", flush=True)
+                else:
+                    print(f"[DEBUG] _merge_ros2_telemetry found in globals", flush=True)
+                
                 _merge_ros2_telemetry(telemetry_data)
                 now = time.time()
                 if now - _last_telemetry_activity_log >= TELEMETRY_ACTIVITY_INTERVAL:
@@ -254,8 +257,22 @@ if ROS_AVAILABLE:
                 'result': bool(getattr(response, 'result', False)),
             }
 
-    # Initialize ROS2 bridge
-    rclpy.init()
+    # Initialize ROS2 bridge (guard against multiple init calls)
+    try:
+        # Force initialization with try/except for duplicate init
+        rclpy.init()
+        print("[INFO] ROS2 context initialized successfully", flush=True)
+        print(f"[DEBUG] server.py: rclpy.ok() after init = {rclpy.ok()}", flush=True)
+        print(f"[DEBUG] server.py: rclpy module id = {id(rclpy)}", flush=True)
+    except RuntimeError as exc:
+        # Context already exists - this is OK
+        if "has already been initialized" in str(exc) or "already been called" in str(exc):
+            print(f"[INFO] ROS2 context already initialized (OK)", flush=True)
+            print(f"[DEBUG] server.py: rclpy.ok() = {rclpy.ok()}", flush=True)
+            print(f"[DEBUG] server.py: rclpy module id = {id(rclpy)}", flush=True)
+        else:
+            print(f"[ERROR] Unexpected rclpy.init() error: {exc}", flush=True)
+            raise
     telemetry_bridge = TelemetryBridge()
     try:
         command_bridge = CommandBridge()
@@ -301,6 +318,10 @@ def _shutdown_ros_runtime() -> None:
         if _ros_shutdown_done:
             return
         _ros_shutdown_done = True
+    
+    print("[INFO] _shutdown_ros_runtime() called - cleaning up ROS resources", flush=True)
+    import traceback
+    traceback.print_stack()  # Show who called shutdown
 
     try:
         if _ros_executor is not None:
@@ -344,9 +365,10 @@ def _shutdown_ros_runtime() -> None:
 
     try:
         if ROS_AVAILABLE and rclpy is not None:
+            print("[INFO] Calling rclpy.shutdown()", flush=True)
             rclpy.shutdown()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[WARN] rclpy.shutdown() failed: {exc}", flush=True)
 
     if fcntl is not None:
         global _singleton_lock_handle
@@ -363,16 +385,6 @@ def _shutdown_ros_runtime() -> None:
 
 
 atexit.register(_shutdown_ros_runtime)
-
-# Register WP_MARK cleanup
-try:
-    try:
-        from .servo_manager.wp_mark.api_routes import cleanup_wp_mark
-    except ImportError:
-        from servo_manager.wp_mark.api_routes import cleanup_wp_mark
-    atexit.register(cleanup_wp_mark)
-except Exception:
-    pass
 
 
 def _acquire_singleton_lock() -> None:
@@ -1704,6 +1716,53 @@ def telemetry_loop():
         socketio.sleep(0.5)
 
 
+def connection_health_monitor():
+    """Monitor client connections and emit health status periodically."""
+    while True:
+        try:
+            current_time = time.time()
+            
+            # Check for stale client connections
+            stale_clients = []
+            for client_id, session in list(_client_sessions.items()):
+                time_since_ping = current_time - session.get('last_ping', current_time)
+                
+                # Mark clients as stale if no ping for 30 seconds
+                if time_since_ping > 30:
+                    stale_clients.append(client_id)
+                    session['missed_pings'] = session.get('missed_pings', 0) + 1
+                    
+                    # Emit warning to specific client
+                    socketio.emit('connection_warning', {
+                        'message': 'Connection may be unstable',
+                        'time_since_ping': time_since_ping,
+                        'timestamp': current_time
+                    }, room=client_id)
+            
+            # Clean up very stale sessions (no activity for 5 minutes)
+            for client_id in list(_client_sessions.keys()):
+                session = _client_sessions[client_id]
+                if current_time - session.get('last_ping', current_time) > 300:
+                    _client_sessions.pop(client_id, None)
+                    log_message(f'Cleaned up stale session: {client_id}', 'INFO')
+            
+            # Emit overall health status
+            active_clients = len(_client_sessions) - len(stale_clients)
+            socketio.emit('server_health', {
+                'timestamp': current_time,
+                'active_clients': active_clients,
+                'total_clients': len(_client_sessions),
+                'vehicle_connected': is_vehicle_connected,
+                'ros_available': ROS_AVAILABLE,
+                'uptime': current_time
+            })
+            
+        except Exception as exc:
+            log_message(f"Connection health monitor error: {exc}", "ERROR")
+        
+        socketio.sleep(10)  # Check every 10 seconds
+
+
 # ============================================================================
 # COMMAND HANDLERS
 # ============================================================================
@@ -2446,14 +2505,50 @@ def handle_connect():
 def handle_disconnect():
     client_id = request.sid
     log_message(f'❌ Client disconnected: {client_id}', 'INFO')
+    # Clear client-specific state if needed
+    _client_sessions.pop(client_id, None)
 
+
+# Track client sessions for connection quality monitoring
+_client_sessions = {}
 
 @socketio.on('ping')
-def handle_ping():
-    """Handle ping from client for connection testing."""
+def handle_ping(data=None):
+    """Handle ping from client for connection testing with latency tracking."""
     client_id = request.sid
-    log_message(f'📡 Ping from {client_id}', 'DEBUG')
-    emit('pong', {'timestamp': time.time()})
+    current_time = time.time()
+    
+    # Initialize client session if not exists
+    if client_id not in _client_sessions:
+        _client_sessions[client_id] = {
+            'connected_at': current_time,
+            'last_ping': current_time,
+            'ping_count': 0,
+            'missed_pings': 0
+        }
+    
+    session = _client_sessions[client_id]
+    session['last_ping'] = current_time
+    session['ping_count'] += 1
+    
+    # Calculate connection quality metrics
+    ping_interval = current_time - session.get('last_ping_response', current_time)
+    
+    # Respond with comprehensive connection info
+    response_data = {
+        'timestamp': current_time,
+        'server_time': current_time,
+        'session_id': client_id,
+        'ping_count': session['ping_count'],
+        'connection_quality': 'good' if ping_interval < 2.0 else 'degraded' if ping_interval < 5.0 else 'poor'
+    }
+    
+    # Include client-sent timestamp if available for RTT calculation
+    if data and isinstance(data, dict) and 'client_timestamp' in data:
+        response_data['client_timestamp'] = data['client_timestamp']
+    
+    emit('pong', response_data)
+    session['last_ping_response'] = current_time
 
 
 @socketio.on('request_rover_reconnect')
@@ -2481,14 +2576,20 @@ def handle_rover_reconnect():
 
 
 @socketio.on('send_command')
-def handle_command(data):
-    """Handle incoming commands from the frontend."""
+def handle_command(data, ack_callback=None):
+    """Handle incoming commands from the frontend with acknowledgment support."""
     try:
         _require_vehicle_bridge()
     except Exception as exc:
         log_message("Command rejected - vehicle not connected", "ERROR", event_type='ui_request')
-        payload = {'status': 'error', 'message': str(exc)}
-        emit('command_response', payload)
+        payload = {'status': 'error', 'message': str(exc), 'acked': True}
+        
+        # Send acknowledgment if callback provided
+        if ack_callback:
+            ack_callback(payload)
+        else:
+            emit('command_response', payload)
+        
         record_activity(
             "Socket command rejected - vehicle not connected",
             level='ERROR',
@@ -2514,9 +2615,15 @@ def handle_command(data):
         log_message(f"Unknown command: {command_type}", "ERROR", event_type='ui_request')
         payload = {
             'status': 'error',
-            'message': f'Unknown command: {command_type}'
+            'message': f'Unknown command: {command_type}',
+            'acked': True
         }
-        emit('command_response', payload)
+        
+        if ack_callback:
+            ack_callback(payload)
+        else:
+            emit('command_response', payload)
+        
         record_activity(
             f"Unknown command received: {command_type}",
             level='ERROR',
@@ -2527,36 +2634,50 @@ def handle_command(data):
 
     try:
         result = handler(data)
+        response_payload = None
+        
         if isinstance(result, dict):
-            emit('command_response', result)
+            response_payload = {**result, 'acked': True}
             record_activity(
                 f"Socket command '{command_type}' processed",
                 event_type='server_response',
                 meta={'command': command_type, 'response': _make_json_safe(result)}
             )
         elif isinstance(result, str):
-            emit('command_response', {'status': 'success', 'message': result})
+            response_payload = {'status': 'success', 'message': result, 'acked': True}
             record_activity(
                 f"Socket command '{command_type}' processed",
                 event_type='server_response',
                 meta={'command': command_type, 'message': result}
             )
         else:
-            payload = {'status': 'success', 'message': f"{command_type} dispatched"}
-            emit('command_response', payload)
+            response_payload = {'status': 'success', 'message': f"{command_type} dispatched", 'acked': True}
             record_activity(
                 f"Socket command '{command_type}' processed",
                 event_type='server_response',
-                meta={'command': command_type, 'message': payload['message']}
+                meta={'command': command_type, 'message': response_payload['message']}
             )
+        
+        # Send acknowledgment
+        if ack_callback:
+            ack_callback(response_payload)
+        else:
+            emit('command_response', response_payload)
+            
     except Exception as e:
         log_message(f"Command error ({command_type}): {e}", "ERROR", event_type='server_response')
         payload = {
             'status': 'error',
             'message': str(e),
-            'command': command_type
+            'command': command_type,
+            'acked': True
         }
-        emit('command_response', payload)
+        
+        if ack_callback:
+            ack_callback(payload)
+        else:
+            emit('command_response', payload)
+        
         record_activity(
             f"Socket command '{command_type}' failed",
             level='ERROR',
@@ -3250,9 +3371,9 @@ def servo_run():
         return jsonify({"error": "missing mode"}), 400
 
     scripts = {
-        "wpmark": "wp_mark.py",
         "continuous": "continuous_line.py",
         "interval": "interval_spray.py",
+        "wpmark": "wpmark.py",
     }
     if mode not in scripts:
         return jsonify({"error": "invalid mode"}), 400
@@ -3371,7 +3492,6 @@ def servo_edit():
     except Exception:
         cfg = {}
     for k, v in data.items():
-        # e.g. "wp_mark.delay_before_on"=2.0
         keys = k.split(".")
         ref = cfg
         for part in keys[:-1]:
@@ -3450,6 +3570,9 @@ try:
 
     socketio.start_background_task(telemetry_loop)
     log_message("Telemetry task started")
+
+    socketio.start_background_task(connection_health_monitor)
+    log_message("Connection health monitor started")
 
     log_message("All background tasks started successfully", "SUCCESS")
     log_message("Starting Flask-SocketIO server on http://0.0.0.0:5001", "SUCCESS")
