@@ -13,7 +13,8 @@ import os
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
-
+import json
+from std_msgs.msg import String
 import roslibpy
 
 TelemetryCallback = Callable[[Dict[str, Any]], None]
@@ -49,6 +50,7 @@ class MavrosBridge:
         self.port = int(port if port is not None else os.getenv("MAVROS_BRIDGE_PORT", "9090"))  # rosbridge_server WebSocket port
         self.fcu_url = os.getenv("MAVROS_FCU_URL", "/dev/ttyACM0:115200")
 
+        # ...existing code...
         self._ros = roslibpy.Ros(host=self.host, port=self.port)
         self._lock = threading.Lock()
         self._connected = False
@@ -73,6 +75,10 @@ class MavrosBridge:
 
         self._rtcm_topic: Optional[roslibpy.Topic] = None
         self._setpoint_topic: Optional[roslibpy.Topic] = None
+
+        # Mission controller integration - REMOVED
+        # Mission controller topics and handlers have been removed
+        # Use direct MAVROS services for mission operations
 
         self._ros.on_ready(self._on_ready, run_in_thread=True)
         self._ros.on("close", lambda _: self._on_close())

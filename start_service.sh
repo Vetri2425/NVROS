@@ -163,16 +163,22 @@ start_ros_process "rosbridge_server" \
     "/rosbridge_websocket" || exit 1
 
 start_ros_process "MAVROS" \
-    "ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:115200 gcs_url:=tcp-l://0.0.0.0:5761" \
+    "ros2 launch mavros apm.launch fcu_url:=/dev/ttyACM0:115200" \
     "/mavros" || exit 1
 
 start_ros_process "GPS Altitude Corrector" \
     "python3 Backend/gps_altitude_corrector.py" \
     "/gps_altitude_corrector"
 
+
 start_ros_process "Telemetry Node" \
     "python3 -m Backend.telemetry_node" \
     ""
+
+# Mission Controller - DISABLED (causes rover rotation issue)
+# start_ros_process "Mission Controller" \
+#     "python3 -m Backend.mission_controller_node" \
+#     "/mission_controller"
 
 start_backend || exit 1
 

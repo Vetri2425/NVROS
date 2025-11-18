@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import eventlet
+import subprocess
 eventlet.monkey_patch()  # <-- ADD THIS LINE
 import threading
 import time
@@ -10,10 +11,23 @@ import base64
 import socket
 import sys
 import tempfile
+import os
+from datetime import datetime
 from collections import deque
 from itertools import count
 from flask import Flask, request, jsonify, Response, render_template
 from flask_socketio import SocketIO, emit
+
+
+# Mission Controller Process Management - REMOVED
+# The mission controller node has been removed due to causing rover rotation issues
+# with problematic Pixhawk parameter interactions
+
+class RosNodeManager:
+    def __init__(self):
+        pass  # Mission controller removed
+
+ros_manager = RosNodeManager()
 from flask_cors import CORS
 from pymavlink.dialects.v20 import common as mavlink
 from dataclasses import dataclass, asdict, field
@@ -34,15 +48,21 @@ except Exception:
     # When running as a script from the Backend directory
     from mavros_bridge import MavrosBridge  # type: ignore
 
+
 # Import network monitor for WiFi/LoRa status
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.network_monitor import NetworkMonitor
 
+
+
+# --- Flask & SocketIO Setup ---
 # --- Flask & SocketIO Setup ---
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# --- WebSocket Mission Controller Integration ---
 
 # Enhanced CORS handling for external browser access
 @app.before_request
@@ -92,6 +112,10 @@ socketio = SocketIO(
     # Increase buffer size for better reliability
     max_http_buffer_size=1e8
 )
+
+# --- Mission Controller WebSocket Handlers - REMOVED ---
+# Mission controller node and related handlers have been removed
+# Use direct MAVROS integration for mission control instead
 
 ROS_DISTRO = os.environ.get('ROS_DISTRO', 'humble')
 _ros_lib_dir = f"/opt/ros/{ROS_DISTRO}/lib"
@@ -383,56 +407,6 @@ def _shutdown_ros_runtime() -> None:
                 pass
             _singleton_lock_handle = None
 
-
-atexit.register(_shutdown_ros_runtime)
-
-
-def _acquire_singleton_lock() -> None:
-    """Prevent multiple backend instances from sharing the same TCP port."""
-    global _singleton_lock_handle
-
-    if fcntl is None:
-        return  # Platform without fcntl cannot rely on this lock; fall back to best effort.
-
-    lock_path = os.environ.get('NRP_BACKEND_LOCK_FILE')
-    if not lock_path:
-        lock_path = os.path.join(tempfile.gettempdir(), 'nrp_backend.lock')
-
-    try:
-        handle = open(lock_path, 'w')
-    except Exception as exc:
-        print(f"[WARN] Unable to open backend lock file {lock_path}: {exc}", flush=True)
-        return
-
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(f"[WARN] Another NRP backend instance is already running (lock {lock_path}). Exiting duplicate.", flush=True)
-        try:
-            handle.close()
-        except Exception:
-            pass
-        sys.exit(0)
-    except Exception as exc:
-        print(f"[WARN] Unable to lock backend file {lock_path}: {exc}", flush=True)
-        try:
-            handle.close()
-        except Exception:
-            pass
-        return
-
-    try:
-        handle.truncate(0)
-        handle.write(str(os.getpid()))
-        handle.flush()
-    except Exception:
-        pass
-
-    _singleton_lock_handle = handle
-
-
-# --- MAVROS Connection Configuration ---
-_acquire_singleton_lock()
 
 os.environ["MAVROS_BRIDGE_HOST"] = "127.0.0.1"    # Local MAVROS instance
 os.environ["MAVROS_BRIDGE_PORT"] = "9090"         # rosbridge_server WebSocket port
@@ -1941,6 +1915,21 @@ def _handle_upload_mission(data):
         mission_log_state['last_active_seq'] = None
         mission_log_state['last_reached_seq'] = None
     
+    # Send load_mission command to mission controller node
+    try:
+        load_mission_data = {
+            'command': 'load_mission',
+            'waypoints': waypoints,
+            'config': servo_config or {}
+        }
+        if hasattr(bridge, 'publish_mission_command'):
+            bridge.publish_mission_command(load_mission_data)
+            log_message(f"Sent load_mission command to mission controller ({mission_count} waypoints)", "INFO")
+        else:
+            log_message("Warning: MAVROS bridge not available for load_mission command", "WARNING")
+    except Exception as e:
+        log_message(f"Failed to send load_mission to mission controller: {e}", "ERROR")
+    
     # Record activity
     _record_mission_event(
         f"Mission uploaded ({mission_count} items)",
@@ -3025,6 +3014,557 @@ def api_mission_resume():
         return _http_error(str(exc), 500)
 
 
+@app.post("/api/mission/load_controller")
+def api_mission_load_controller():
+    """
+    Load mission waypoints to the Jetson mission controller node.
+    
+    This sends a load_mission command to the ROS mission controller
+    without uploading to the Pixhawk. Used for spraying operations.
+    
+    Expected JSON body:
+    {
+        "waypoints": [{"lat": 13.071922, "lng": 80.2619957, ...}],
+        "servoConfig": {"mode": "interval", ...}  // optional
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    waypoints = body.get('waypoints')
+    
+    if not isinstance(waypoints, list) or not waypoints:
+        return _http_error("No waypoints provided", 400)
+    
+    # Validate waypoints have required fields
+    for wp in waypoints:
+        if not all(k in wp for k in ['lat', 'lng']):
+            return _http_error(f"Waypoint missing required fields: {wp}", 400)
+    
+    try:
+        bridge = _require_vehicle_bridge()
+        
+        # Apply servo configuration if provided
+        servo_config = body.get('servoConfig')
+        if servo_config:
+            log_message(f"[mission_load_controller] Applying servo mode: {servo_config.get('mode')}", "INFO")
+            waypoints = apply_servo_modes(waypoints, servo_config)
+        
+        mission_count = len(waypoints)
+        
+        # Send load_mission command to mission controller node
+        load_mission_data = {
+            'command': 'load_mission',
+            'waypoints': waypoints,
+            'config': servo_config or {}
+        }
+        
+        if hasattr(bridge, 'publish_mission_command'):
+            bridge.publish_mission_command(load_mission_data)
+            log_message(f"Sent load_mission command to mission controller ({mission_count} waypoints)", "INFO")
+            
+            # Update local mission state for consistency
+            global current_mission
+            current_mission = list(waypoints)
+            
+            return _http_success(f"Mission loaded to controller ({mission_count} waypoints)")
+        else:
+            return _http_error("MAVROS bridge not available for mission controller commands", 500)
+            
+    except Exception as exc:
+        log_message(f"/api/mission/load_controller error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/start_controller")
+def api_mission_start_controller():
+    """
+    Start mission execution on the Jetson mission controller node.
+    
+    This sends a 'start' command to the ROS mission controller
+    to begin autonomous waypoint execution with spraying.
+    
+    The mission controller must have waypoints loaded first
+    via /api/mission/load_controller.
+    """
+    try:
+        bridge = _require_vehicle_bridge()
+        
+        # Send start command to mission controller node
+        start_command = {'command': 'start'}
+        
+        if hasattr(bridge, 'publish_mission_command'):
+            bridge.publish_mission_command(start_command)
+            log_message("Sent start command to mission controller", "INFO")
+            
+            return _http_success("Mission controller started")
+        else:
+            return _http_error("MAVROS bridge not available for mission controller commands", 500)
+            
+    except Exception as exc:
+        log_message(f"/api/mission/start_controller error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.get("/api/mission/config")
+def api_mission_config():
+    """
+    Return full mission controller configuration (mission_controller section) from
+    the mission_controller_config.json file.
+    """
+    try:
+        config_file = os.path.join(os.path.dirname(__file__), 'config', 'mission_controller_config.json')
+        if not os.path.exists(config_file):
+            return _http_error("Configuration file not found", 404)
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        mc = config.get('mission_controller', {})
+        return _http_success(mc)
+    except Exception as exc:
+        log_message(f"/api/mission/config error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/config")
+def api_mission_config_update():
+    """
+    Update mission controller servo configuration and timing parameters.
+    
+    RESPONSIBILITY: Servo & Timer Configuration ONLY
+    - Updates servo channel, PWM values, spray timing, GPS timeout, mode
+    - Applies to currently loaded mission (if any)
+    - Does NOT handle waypoint loading
+    
+    Expected JSON body:
+    {
+        "servo_channel": 10,
+        "servo_pwm_start": 1500,
+        "servo_pwm_stop": 1100,
+        "spray_duration": 5.0,
+        "delay_before_spray": 1.0,
+        "delay_after_spray": 1.0,
+        "gps_timeout": 30.0,
+        "auto_mode": true
+    }
+    """
+    global current_mission
+    try:
+        body = request.get_json(silent=True) or {}
+        
+        # Validate required servo/timer parameters
+        required_params = ['servo_channel', 'servo_pwm_start', 'servo_pwm_stop', 
+                          'spray_duration', 'delay_before_spray', 'delay_after_spray', 
+                          'gps_timeout', 'auto_mode']
+        
+        for param in required_params:
+            if param not in body:
+                return _http_error(f"Missing required parameter: {param}", 400)
+        
+        # Reject waypoint data if included (wrong endpoint)
+        if 'waypoints' in body:
+            return _http_error("Waypoints should not be included in /api/mission/config. Use /api/mission/load instead.", 400)
+        
+        # Load existing config
+        config_file = os.path.join(os.path.dirname(__file__), 'config', 'mission_controller_config.json')
+        
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+        else:
+            config = {
+                "mission_controller": {
+                    "sprayer_parameters": {},
+                    "mission_parameters": {
+                        "waypoint_reach_threshold": 2.0,
+                        "max_retry_attempts": 3,
+                        "retry_delay": 5.0,
+                        "status_update_interval": 1.0
+                    },
+                    "safety_parameters": {
+                        "max_speed": 5.0,
+                        "emergency_stop_enabled": True,
+                        "low_battery_threshold": 20.0,
+                        "connection_timeout": 10.0
+                    }
+                },
+                "metadata": {
+                    "version": "1.0",
+                    "last_updated": "2025-11-10",
+                    "description": "Mission controller configuration for NRP ROS spraying system"
+                }
+            }
+        
+        # Update ONLY sprayer parameters (servo & timing)
+        config['mission_controller']['sprayer_parameters'] = body
+        config['metadata']['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Save config to file
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        log_message("Servo config saved to file", "INFO")
+        
+        # Send load_mission command to mission controller with updated config
+        try:
+            bridge = _require_vehicle_bridge()
+            
+            # Send command only if there are waypoints loaded
+            if current_mission and len(current_mission) > 0:
+                load_mission_data = {
+                    'command': 'load_mission',
+                    'waypoints': current_mission,
+                    'config': body
+                }
+                
+                if hasattr(bridge, 'publish_mission_command'):
+                    bridge.publish_mission_command(load_mission_data)
+                    log_message(f"Sent load_mission command with updated servo config to mission controller", "INFO")
+                else:
+                    log_message("Warning: publish_mission_command not available, config saved but not applied", "WARNING")
+            else:
+                log_message("No mission waypoints loaded, config saved but not sent to mission controller", "INFO")
+                
+        except Exception as e:
+            # Config was saved successfully, log warning but don't fail the request
+            log_message(f"Warning: Config saved but failed to send command to mission controller: {e}", "WARNING")
+        
+        return _http_success("Servo config updated (applies to current mission)")
+        
+    except Exception as exc:
+        log_message(f"/api/mission/config POST error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/load")
+def api_mission_load():
+    """
+    Load waypoints to the mission controller.
+    
+    RESPONSIBILITY: Waypoint Loading ONLY
+    - Accepts waypoint list with lat/lng coordinates
+    - Updates current_mission global variable
+    - Sends load_mission command with waypoints to mission controller
+    - Does NOT handle servo configuration (use /api/mission/config for that)
+    - Can optionally apply servo modes based on waypoint attributes
+    
+    Expected JSON body:
+    {
+      "waypoints": [
+        {"lat": 13.071922, "lng": 80.2619957},
+        {"lat": 13.072000, "lng": 80.2620000}
+      ]
+    }
+    
+    Note: servoConfig field (if included) is for backward compatibility only.
+          New implementations should use /api/mission/config endpoint.
+    """
+    body = request.get_json(silent=True) or {}
+    waypoints = body.get('waypoints')
+    if not isinstance(waypoints, list) or not waypoints:
+        return _http_error("No waypoints provided", 400)
+
+    # Validate required fields for waypoints
+    for wp in waypoints:
+        if not all(k in wp for k in ['lat', 'lng']):
+            return _http_error(f"Waypoint missing required fields (lat, lng): {wp}", 400)
+
+    try:
+        bridge = _require_vehicle_bridge()
+
+        # Optional: Apply servo modes based on waypoint data (backward compatibility)
+        servo_config = body.get('servoConfig')
+        if servo_config:
+            log_message(f"[mission_load] Applying servo mode: {servo_config.get('mode')}", "INFO")
+            waypoints = apply_servo_modes(waypoints, servo_config)
+
+        mission_count = len(waypoints)
+        
+        # Prepare load_mission command with waypoints
+        # Config will be applied separately via /api/mission/config
+        load_mission_data = {
+            'command': 'load_mission',
+            'waypoints': waypoints,
+            'config': servo_config or {}
+        }
+
+        if hasattr(bridge, 'publish_mission_command'):
+            bridge.publish_mission_command(load_mission_data)
+            log_message(f"Sent load_mission command to mission controller ({mission_count} waypoints)", "INFO")
+
+            # Update local mission state for consistency
+            global current_mission
+            current_mission = list(waypoints)
+            _record_mission_event(f"Mission loaded to controller ({mission_count} waypoints)", status='MISSION_LOADED')
+
+            return _http_success(f"Mission loaded to controller ({mission_count} waypoints)")
+        else:
+            return _http_error("MAVROS bridge not available for mission controller commands", 500)
+    except Exception as exc:
+        log_message(f"/api/mission/load error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+def _publish_controller_cmd_or_error(cmd: dict):
+    """Helper to publish a command dict to the mission controller or return an error tuple."""
+    try:
+        bridge = _require_vehicle_bridge()
+    except Exception as exc:
+        return None, _http_error(str(exc), 500)
+
+    if not hasattr(bridge, 'publish_mission_command'):
+        return None, _http_error("MAVROS bridge not available for mission controller commands", 500)
+
+    try:
+        bridge.publish_mission_command(cmd)
+        return True, None
+    except Exception as exc:
+        log_message(f"Failed to publish mission controller command {cmd}: {exc}", "ERROR")
+        return None, _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/start")
+def api_mission_start():
+    try:
+        ok, err = _publish_controller_cmd_or_error({'command': 'start'})
+        if err:
+            return err
+        _record_mission_event('Mission controller started', status='MISSION_STARTED')
+        return _http_success('Mission controller started')
+    except Exception as exc:
+        log_message(f"/api/mission/start error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/stop")
+def api_mission_stop():
+    try:
+        ok, err = _publish_controller_cmd_or_error({'command': 'stop'})
+        if err:
+            return err
+        _record_mission_event('Mission controller stopped', status='MISSION_STOPPED')
+        return _http_success('Mission controller stopped')
+    except Exception as exc:
+        log_message(f"/api/mission/stop error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/pause")
+def api_mission_pause_frontend():
+    try:
+        ok, err = _publish_controller_cmd_or_error({'command': 'pause'})
+        if err:
+            return err
+        _record_mission_event('Mission paused (controller)', status='MISSION_PAUSED')
+        return _http_success('Mission paused')
+    except Exception as exc:
+        log_message(f"/api/mission/pause error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/resume")
+def api_mission_resume_frontend():
+    try:
+        ok, err = _publish_controller_cmd_or_error({'command': 'resume'})
+        if err:
+            return err
+        _record_mission_event('Mission resumed (controller)', status='MISSION_RESUMED')
+        return _http_success('Mission resumed')
+    except Exception as exc:
+        log_message(f"/api/mission/resume error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/restart")
+def api_mission_restart():
+    """
+    Restart the mission controller. Prefer explicit 'restart' command; if not
+    supported, perform stop then start.
+    """
+    try:
+        # Try restart first
+        ok, err = _publish_controller_cmd_or_error({'command': 'restart'})
+        if err is None and ok:
+            _record_mission_event('Mission controller restarted', status='MISSION_RESTARTED')
+            return _http_success('Mission controller restarted')
+
+        # Fallback: stop then start
+        _publish_controller_cmd_or_error({'command': 'stop'})
+        socketio.sleep(0.1)
+        _publish_controller_cmd_or_error({'command': 'start'})
+        _record_mission_event('Mission controller restarted (stop/start)', status='MISSION_RESTARTED')
+        return _http_success('Mission controller restarted (stop/start)')
+    except Exception as exc:
+        log_message(f"/api/mission/restart error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/next")
+def api_mission_next():
+    """Advance mission controller to the next waypoint/step."""
+    try:
+        ok, err = _publish_controller_cmd_or_error({'command': 'next'})
+        if err:
+            return err
+        _record_mission_event('Mission controller advanced to next', status='MISSION_NEXT')
+        return _http_success('Advanced to next mission step')
+    except Exception as exc:
+        log_message(f"/api/mission/next error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/stop_controller")
+def api_mission_stop_controller():
+    """
+    Stop mission execution on the Jetson mission controller node.
+    
+    This sends a 'stop' command to the ROS mission controller
+    to halt autonomous waypoint execution and spraying operations.
+    
+    The mission controller will return to idle state.
+    """
+    try:
+        bridge = _require_vehicle_bridge()
+        
+        # Send stop command to mission controller node
+        stop_command = {'command': 'stop'}
+        
+        if hasattr(bridge, 'publish_mission_command'):
+            bridge.publish_mission_command(stop_command)
+            log_message("Sent stop command to mission controller", "INFO")
+            
+            return _http_success("Mission controller stopped")
+        else:
+            return _http_error("MAVROS bridge not available for mission controller commands", 500)
+            
+    except Exception as exc:
+        log_message(f"/api/mission/stop_controller error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.get("/api/config/sprayer")
+def api_get_sprayer_config():
+    """
+    Get current sprayer configuration parameters for the mission controller.
+    
+    Returns the current sprayer parameters from the config file.
+    """
+    try:
+        config_file = os.path.join(os.path.dirname(__file__), 'config', 'mission_controller_config.json')
+        
+        if not os.path.exists(config_file):
+            return _http_error("Configuration file not found", 404)
+        
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        sprayer_params = config.get('mission_controller', {}).get('sprayer_parameters', {})
+        return _http_success(sprayer_params)
+        
+    except Exception as exc:
+        log_message(f"/api/config/sprayer GET error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/config/sprayer")
+def api_save_sprayer_config():
+    """
+    Save sprayer configuration parameters for the mission controller.
+    
+    Expected JSON body:
+    {
+        "servo_channel": 10,
+        "servo_pwm_start": 1500,
+        "servo_pwm_stop": 1100,
+        "spray_duration": 5.0,
+        "delay_before_spray": 1.0,
+        "delay_after_spray": 1.0,
+        "gps_timeout": 30.0,
+        "auto_mode": true
+    }
+    """
+    global current_mission
+    try:
+        body = request.get_json(silent=True) or {}
+        
+        # Validate required parameters
+        required_params = ['servo_channel', 'servo_pwm_start', 'servo_pwm_stop', 
+                          'spray_duration', 'delay_before_spray', 'delay_after_spray', 
+                          'gps_timeout', 'auto_mode']
+        
+        for param in required_params:
+            if param not in body:
+                return _http_error(f"Missing required parameter: {param}", 400)
+        
+        # Load existing config
+        config_file = os.path.join(os.path.dirname(__file__), 'config', 'mission_controller_config.json')
+        
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+        else:
+            # Create default config structure if file doesn't exist
+            config = {
+                "mission_controller": {
+                    "sprayer_parameters": {},
+                    "mission_parameters": {
+                        "waypoint_reach_threshold": 2.0,
+                        "max_retry_attempts": 3,
+                        "retry_delay": 5.0,
+                        "status_update_interval": 1.0
+                    },
+                    "safety_parameters": {
+                        "max_speed": 5.0,
+                        "emergency_stop_enabled": True,
+                        "low_battery_threshold": 20.0,
+                        "connection_timeout": 10.0
+                    }
+                },
+                "metadata": {
+                    "version": "1.0",
+                    "last_updated": "2025-11-10",
+                    "description": "Mission controller configuration for NRP ROS spraying system"
+                }
+            }
+        
+        # Update sprayer parameters
+        config['mission_controller']['sprayer_parameters'] = body
+        config['metadata']['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Save config
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        log_message("Sprayer configuration saved", "INFO")
+        
+        # Send load_mission command to mission controller with updated servo config
+        try:
+            bridge = _require_vehicle_bridge()
+            
+            # Send command only if there are waypoints loaded
+            if current_mission and len(current_mission) > 0:
+                load_mission_data = {
+                    'command': 'load_mission',
+                    'waypoints': current_mission,
+                    'config': body
+                }
+                
+                if hasattr(bridge, 'publish_mission_command'):
+                    bridge.publish_mission_command(load_mission_data)
+                    log_message(f"Sent load_mission command to mission controller with updated servo config", "INFO")
+                else:
+                    log_message("Warning: publish_mission_command not available, config saved but not applied", "WARNING")
+            else:
+                log_message("No mission waypoints loaded, config saved but not applied to mission controller", "INFO")
+                
+        except Exception as e:
+            # Config was saved successfully, log warning but don't fail the request
+            log_message(f"Warning: Config saved but failed to send command to mission controller: {e}", "WARNING")
+        
+        return _http_success("Sprayer configuration saved and applied to mission controller")
+        
+    except Exception as exc:
+        log_message(f"/api/config/sprayer POST error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
 @app.post("/api/rtk/inject")
 def api_rtk_inject():
     """
@@ -3559,6 +4099,11 @@ def servo_log():
         return jsonify({"log": "".join(lines)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# --- Mission Controller WebSocket Event Handlers - REMOVED ---
+# Mission controller node has been deleted
+# Use direct MAVROS services for mission operations
 
 
 try:
