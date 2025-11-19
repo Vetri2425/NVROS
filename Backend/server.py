@@ -48,6 +48,12 @@ except Exception:
     # When running as a script from the Backend directory
     from mavros_bridge import MavrosBridge  # type: ignore
 
+try:
+    # Import integrated mission controller
+    from .integrated_mission_controller import IntegratedMissionController, MissionState, MissionMode  # type: ignore
+except Exception:
+    from integrated_mission_controller import IntegratedMissionController, MissionState, MissionMode  # type: ignore
+
 
 # Import network monitor for WiFi/LoRa status
 import sys
@@ -337,7 +343,7 @@ _ros_shutdown_done = False
 
 def _shutdown_ros_runtime() -> None:
     """Best-effort cleanup for ROS resources when the process exits."""
-    global _ros_shutdown_done
+    global _ros_shutdown_done, mission_controller
     with _ros_shutdown_lock:
         if _ros_shutdown_done:
             return
@@ -346,6 +352,15 @@ def _shutdown_ros_runtime() -> None:
     print("[INFO] _shutdown_ros_runtime() called - cleaning up ROS resources", flush=True)
     import traceback
     traceback.print_stack()  # Show who called shutdown
+
+    # Cleanup mission controller first
+    try:
+        if mission_controller is not None:
+            print("[INFO] Shutting down integrated mission controller", flush=True)
+            mission_controller.shutdown()
+            mission_controller = None
+    except Exception as exc:
+        print(f"[WARN] Mission controller cleanup failed: {exc}", flush=True)
 
     try:
         if _ros_executor is not None:
@@ -419,6 +434,10 @@ current_mission = []  # Store current mission waypoints
 mavros_bridge_lock = threading.Lock()
 mavros_telem_lock = threading.Lock()
 mavros_connection_last_attempt = 0.0
+
+# --- Integrated Mission Controller ---
+mission_controller: Optional[IntegratedMissionController] = None
+latest_mission_status: dict = {}
 
  
 
@@ -1188,6 +1207,51 @@ def _get_vehicle_bridge(*, require_vehicle: bool = True, timeout: float = 5.0) -
     return bridge
 
 
+def handle_mission_status(status_data: dict):
+    """Handle mission status updates from integrated controller and emit to frontend"""
+    global latest_mission_status
+    try:
+        # Store latest status
+        latest_mission_status = status_data
+        
+        # Add server timestamp
+        status_data['server_timestamp'] = time.time()
+        
+        # Log important updates
+        level = status_data.get('level', 'info')
+        message = status_data.get('message', '')
+        
+        if level == 'error':
+            log_message(f"Mission: {message}", "ERROR", event_type='mission')
+        elif level == 'warning':
+            log_message(f"Mission: {message}", "WARNING", event_type='mission')
+        elif level == 'success':
+            log_message(f"Mission: {message}", "INFO", event_type='mission')
+        
+        # Emit to frontend via WebSocket
+        socketio.emit('mission_status', status_data, namespace='/')
+        
+    except Exception as e:
+        log_message(f"Mission status handler error: {e}", "ERROR", event_type='mission')
+
+
+def initialize_mission_controller():
+    """Initialize the integrated mission controller after MAVROS bridge connects"""
+    global mission_controller
+    try:
+        bridge = _init_mavros_bridge()
+        mission_controller = IntegratedMissionController(
+            mavros_bridge=bridge,
+            status_callback=handle_mission_status,
+            logger=app.logger
+        )
+        log_message("Integrated mission controller initialized successfully", "SUCCESS", event_type='mission')
+        return True
+    except Exception as e:
+        log_message(f"Failed to initialize mission controller: {e}", "ERROR", event_type='mission')
+        return False
+
+
 def _require_vehicle_bridge() -> MavrosBridge:
     """Backward-compatible helper enforcing a connected vehicle."""
     return _get_vehicle_bridge(require_vehicle=True)
@@ -1302,11 +1366,14 @@ def _init_mavros_bridge() -> MavrosBridge:
 
 def maintain_mavros_connection():
     """Establish and monitor the MAVROS bridge connection."""
-    global is_vehicle_connected, mavros_connection_last_attempt
+    global is_vehicle_connected, mavros_connection_last_attempt, mission_controller
     while True:
         try:
             bridge = _init_mavros_bridge()
             if bridge.is_connected:
+                # Initialize mission controller if not already done and bridge is connected
+                if mission_controller is None:
+                    initialize_mission_controller()
                 socketio.sleep(2.0)
                 continue
 
@@ -1319,6 +1386,11 @@ def maintain_mavros_connection():
             log_message(f"Attempting MAVROS connection to {bridge.host}:{bridge.port}")
             bridge.connect(timeout=float(os.getenv("MAVROS_CONNECT_TIMEOUT", "10")))
             log_message("MAVROS bridge connected to rosbridge", "SUCCESS")
+            
+            # Initialize mission controller after successful connection
+            if mission_controller is None:
+                initialize_mission_controller()
+                
         except Exception as exc:
             if is_vehicle_connected:
                 is_vehicle_connected = False
@@ -2564,6 +2636,57 @@ def handle_rover_reconnect():
     })
 
 
+@socketio.on('subscribe_mission_status')
+def handle_subscribe_mission_status():
+    """Handle frontend subscription to mission status updates"""
+    try:
+        global latest_mission_status
+        # Send current status immediately if available
+        if latest_mission_status:
+            emit('mission_status', latest_mission_status)
+        
+        # Send confirmation
+        emit('mission_status_subscribed', {
+            'success': True,
+            'message': 'Subscribed to mission status updates'
+        })
+        
+        log_message("Client subscribed to mission status", event_type='mission')
+        
+    except Exception as e:
+        log_message(f"Mission status subscription error: {e}", "ERROR", event_type='mission')
+        emit('mission_status_subscribed', {
+            'success': False,
+            'error': str(e)
+        })
+
+
+@socketio.on('get_mission_status')
+def handle_get_mission_status():
+    """Handle real-time mission status request via WebSocket"""
+    try:
+        global mission_controller, latest_mission_status
+        if mission_controller:
+            status = mission_controller.get_status()
+            emit('mission_status_response', {
+                'success': True,
+                'status': status,
+                'latest_update': latest_mission_status
+            })
+        else:
+            emit('mission_status_response', {
+                'success': False,
+                'error': 'Mission controller not available'
+            })
+            
+    except Exception as e:
+        log_message(f"Mission status request error: {e}", "ERROR", event_type='mission')
+        emit('mission_status_response', {
+            'success': False,
+            'error': str(e)
+        })
+
+
 @socketio.on('send_command')
 def handle_command(data, ack_callback=None):
     """Handle incoming commands from the frontend with acknowledgment support."""
@@ -2710,63 +2833,9 @@ def root():
         'ros_available': ROS_AVAILABLE,
         'endpoints': {
             'health': '/api/health',
-            'rover_data': '/api/rover-data',
-            'servo_control': '/api/servo/control',
-            'servo_status': '/servo/status',
-            'rtk_status': '/api/rtk/status',
-            'mission_upload': '/api/mission/upload',
-            'mission_download': '/api/mission/download',
-            'arm_vehicle': '/api/arm',
-            'set_mode': '/api/set-mode'
+            'rover_data': '/api/rover-data'
         }
     }), 200
-
-
-@app.route('/api/health')
-def health_check():
-    """Health check endpoint - returns backend health status."""
-    try:
-        # Check ROS connection status
-        ros_status = 'connected' if ROS_AVAILABLE else 'unavailable'
-        
-        # Check MAVROS bridge status
-        mavros_connected = False
-        if telemetry_bridge:
-            try:
-                mavros_connected = telemetry_bridge.is_connected()
-            except Exception:
-                pass
-        
-        # Build health response
-        health_data = {
-            'success': True,
-            'status': 'healthy',
-            'timestamp': time.time(),
-            'services': {
-                'ros': ros_status,
-                'mavros': 'connected' if mavros_connected else 'disconnected',
-                'servo': 'available',
-                'rtk': 'available'
-            },
-            'uptime': time.time()
-        }
-        
-        return jsonify(health_data), 200
-        
-    except Exception as e:
-        app.logger.error(f"Health check error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'status': 'unhealthy',
-            'error': str(e),
-            'timestamp': time.time()
-        }), 500
-
-
-# ============================================================================
-# ACTIVITY MONITOR PAGE
-# ============================================================================
-
 
 @app.get("/monitor")
 def monitor_dashboard():
@@ -3285,39 +3354,52 @@ def api_mission_load():
             'config': servo_config or {}
         }
 
-        if hasattr(bridge, 'publish_mission_command'):
-            bridge.publish_mission_command(load_mission_data)
-            log_message(f"Sent load_mission command to mission controller ({mission_count} waypoints)", "INFO")
-
+        # Use integrated mission controller
+        global mission_controller, current_mission
+        
+        if not mission_controller:
+            return _http_error("Mission controller not initialized", 503)
+        
+        result = mission_controller.process_command(load_mission_data)
+        
+        if result.get('success', False):
             # Update local mission state for consistency
-            global current_mission
             current_mission = list(waypoints)
             _record_mission_event(f"Mission loaded to controller ({mission_count} waypoints)", status='MISSION_LOADED')
-
+            log_message(f"Mission loaded to controller ({mission_count} waypoints)", "INFO")
             return _http_success(f"Mission loaded to controller ({mission_count} waypoints)")
         else:
-            return _http_error("MAVROS bridge not available for mission controller commands", 500)
+            error_msg = result.get('error', 'Unknown error')
+            return _http_error(error_msg, 400)
+            
     except Exception as exc:
         log_message(f"/api/mission/load error: {exc}", "ERROR")
         return _http_error(str(exc), 500)
 
 
 def _publish_controller_cmd_or_error(cmd: dict):
-    """Helper to publish a command dict to the mission controller or return an error tuple."""
+    """Helper to process mission command via integrated controller or return an error tuple."""
+    global mission_controller
+    
     try:
-        bridge = _require_vehicle_bridge()
+        if not mission_controller:
+            return None, _http_error("Mission controller not initialized", 503)
+        
+        # Process command through integrated controller
+        result = mission_controller.process_command(cmd)
+        
+        if result.get('success', False):
+            log_message(f"Mission command '{cmd.get('command')}' executed successfully", "INFO", event_type='mission')
+            return True, None
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            log_message(f"Mission command '{cmd.get('command')}' failed: {error_msg}", "WARNING", event_type='mission')
+            return None, _http_error(error_msg, 400)
+        
     except Exception as exc:
-        return None, _http_error(str(exc), 500)
-
-    if not hasattr(bridge, 'publish_mission_command'):
-        return None, _http_error("MAVROS bridge not available for mission controller commands", 500)
-
-    try:
-        bridge.publish_mission_command(cmd)
-        return True, None
-    except Exception as exc:
-        log_message(f"Failed to publish mission controller command {cmd}: {exc}", "ERROR")
-        return None, _http_error(str(exc), 500)
+        error_msg = f"Mission command error: {str(exc)}"
+        log_message(error_msg, "ERROR", event_type='mission')
+        return None, _http_error(error_msg, 500)
 
 
 @app.post("/api/mission/start")
@@ -3331,6 +3413,12 @@ def api_mission_start():
     except Exception as exc:
         log_message(f"/api/mission/start error: {exc}", "ERROR")
         return _http_error(str(exc), 500)
+
+
+@app.get("/api/mission/start")
+def api_mission_start_get():
+    """Inform clients that POST must be used to start missions."""
+    return _http_error("Method not allowed: use POST /api/mission/start to start missions", 405)
 
 
 @app.post("/api/mission/stop")
@@ -3408,6 +3496,88 @@ def api_mission_next():
     except Exception as exc:
         log_message(f"/api/mission/next error: {exc}", "ERROR")
         return _http_error(str(exc), 500)
+
+
+@app.get("/api/mission/status")
+def api_mission_status():
+    """Get current mission controller status"""
+    try:
+        global mission_controller, latest_mission_status
+        if mission_controller:
+            status = mission_controller.get_status()
+            return jsonify({
+                'success': True,
+                'status': status,
+                'latest_update': latest_mission_status
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Mission controller not available'
+            }), 503
+            
+    except Exception as exc:
+        log_message(f"Failed to get mission status: {exc}", "ERROR", event_type='mission')
+        return jsonify({
+            'success': False,
+            'error': str(exc)
+        }), 500
+
+
+@app.get("/api/mission/mode")
+def api_mission_mode_get():
+    """Get current mission mode (auto/manual)"""
+    try:
+        global mission_controller
+        if mission_controller:
+            status = mission_controller.get_status()
+            return jsonify({
+                'success': True,
+                'mode': status.get('mission_mode', 'unknown')
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Mission controller not available'
+            }), 503
+            
+    except Exception as exc:
+        log_message(f"Failed to get mission mode: {exc}", "ERROR", event_type='mission')
+        return jsonify({
+            'success': False,
+            'error': str(exc)
+        }), 500
+
+
+@app.post("/api/mission/mode")
+def api_mission_mode_set():
+    """Set mission mode (auto/manual)"""
+    try:
+        global mission_controller
+        data = request.get_json() or {}
+        mode = data.get('mode', 'auto').lower()
+        
+        if mode not in ['auto', 'manual']:
+            return jsonify({
+                'success': False,
+                'error': 'Mode must be "auto" or "manual"'
+            }), 400
+        
+        if not mission_controller:
+            return jsonify({
+                'success': False,
+                'error': 'Mission controller not available'
+            }), 503
+        
+        result = mission_controller.set_mode(mode)
+        return jsonify(result)
+        
+    except Exception as exc:
+        log_message(f"Failed to set mission mode: {exc}", "ERROR", event_type='mission')
+        return jsonify({
+            'success': False,
+            'error': str(exc)
+        }), 500
 
 
 @app.post("/api/mission/stop_controller")
