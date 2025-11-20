@@ -439,6 +439,10 @@ mavros_connection_last_attempt = 0.0
 mission_controller: Optional[IntegratedMissionController] = None
 latest_mission_status: dict = {}
 
+# PHASE 2 FIX: Status history cache for frontend reconnection
+# Store last 10 mission status messages
+mission_status_history: deque = deque(maxlen=10)
+
  
 
 @dataclass
@@ -1209,28 +1213,41 @@ def _get_vehicle_bridge(*, require_vehicle: bool = True, timeout: float = 5.0) -
 
 def handle_mission_status(status_data: dict):
     """Handle mission status updates from integrated controller and emit to frontend"""
-    global latest_mission_status
+    global latest_mission_status, mission_status_history
     try:
         # Store latest status
         latest_mission_status = status_data
-        
+
         # Add server timestamp
         status_data['server_timestamp'] = time.time()
-        
+
+        # PHASE 2 FIX: Cache status in history for frontend reconnection
+        mission_status_history.append(status_data.copy())
+
         # Log important updates
         level = status_data.get('level', 'info')
         message = status_data.get('message', '')
-        
+
         if level == 'error':
             log_message(f"Mission: {message}", "ERROR", event_type='mission')
         elif level == 'warning':
             log_message(f"Mission: {message}", "WARNING", event_type='mission')
         elif level == 'success':
             log_message(f"Mission: {message}", "INFO", event_type='mission')
-        
+
+        # PHASE 2 FIX: Add emission verification logging
+        # Log critical mission events to track if they reach frontend
+        event_type = status_data.get('extra_data', {}).get('event_type') if 'extra_data' in status_data else None
+        if event_type in ['waypoint_reached', 'waypoint_marked']:
+            log_message(f"📡 EMITTING {event_type}: WP{status_data.get('current_waypoint')} - {message}", "INFO", event_type='mission')
+
         # Emit to frontend via WebSocket
         socketio.emit('mission_status', status_data, namespace='/')
-        
+
+        # PHASE 2 FIX: Log emission success for critical events
+        if event_type in ['waypoint_reached', 'waypoint_marked']:
+            log_message(f"✓ Emission sent to frontend: {event_type}", "DEBUG", event_type='mission')
+
     except Exception as e:
         log_message(f"Mission status handler error: {e}", "ERROR", event_type='mission')
 
@@ -2640,19 +2657,28 @@ def handle_rover_reconnect():
 def handle_subscribe_mission_status():
     """Handle frontend subscription to mission status updates"""
     try:
-        global latest_mission_status
+        global latest_mission_status, mission_status_history
+
+        # PHASE 2 FIX: Send status history on subscription for frontend sync
+        if mission_status_history:
+            emit('mission_status_history', {
+                'success': True,
+                'history': list(mission_status_history)
+            })
+            log_message(f"Sent {len(mission_status_history)} cached status messages to client", event_type='mission')
+
         # Send current status immediately if available
         if latest_mission_status:
             emit('mission_status', latest_mission_status)
-        
+
         # Send confirmation
         emit('mission_status_subscribed', {
             'success': True,
             'message': 'Subscribed to mission status updates'
         })
-        
+
         log_message("Client subscribed to mission status", event_type='mission')
-        
+
     except Exception as e:
         log_message(f"Mission status subscription error: {e}", "ERROR", event_type='mission')
         emit('mission_status_subscribed', {
@@ -3043,35 +3069,15 @@ def api_mission_set_current():
         return _http_error(str(exc), 500)
 
 
-@app.post("/api/mission/pause")
-def api_mission_pause():
-    """
-    Pause mission execution by switching to HOLD mode.
-    """
-    try:
-        bridge = _require_vehicle_bridge()
-        
-        # Switch to HOLD mode to pause mission
-        response = bridge.set_mode(mode="HOLD")
-        
-        log_message("[MISSION] Mission paused (switched to HOLD mode)", "INFO")
-        _record_mission_event("Mission paused", status='MISSION_PAUSED')
-        
-        return _http_success("Mission paused (HOLD mode)")
-    except Exception as exc:
-        log_message(f"/api/mission/pause error: {exc}", "ERROR")
-        return _http_error(str(exc), 500)
-
-
-@app.post("/api/mission/resume")
+@app.post("/api/mission/resume_deprecated")
 def api_mission_resume():
     """
-    Resume mission execution by switching to AUTO mode.
+    Resume mission execution by switching to AUTO mode (DEPRECATED - use controller).
     """
     try:
         bridge = _require_vehicle_bridge()
         
-        # Switch to AUTO mode to resume mission
+        # Switch to AUTO mode to resume mission (DEPRECATED - use controller)
         response = bridge.set_mode(mode="AUTO")
         
         log_message("[MISSION] Mission resumed (switched to AUTO mode)", "INFO")
@@ -3498,6 +3504,20 @@ def api_mission_next():
         return _http_error(str(exc), 500)
 
 
+@app.post("/api/mission/skip")
+def api_mission_skip():
+    """Skip current waypoint and advance to the next waypoint/step."""
+    try:
+        ok, err = _publish_controller_cmd_or_error({'command': 'skip'})
+        if err:
+            return err
+        _record_mission_event('Mission controller skipped waypoint', status='MISSION_SKIP')
+        return _http_success('Skipped to next mission step')
+    except Exception as exc:
+        log_message(f"/api/mission/skip error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
 @app.get("/api/mission/status")
 def api_mission_status():
     """Get current mission controller status"""
@@ -3558,18 +3578,27 @@ def api_mission_mode_set():
         mode = data.get('mode', 'auto').lower()
         
         if mode not in ['auto', 'manual']:
+            log_message(f"Invalid mission mode requested: {mode}", "WARNING", event_type='mission')
             return jsonify({
                 'success': False,
                 'error': 'Mode must be "auto" or "manual"'
             }), 400
         
         if not mission_controller:
+            log_message("Mission controller not available for mode change", "ERROR", event_type='mission')
             return jsonify({
                 'success': False,
                 'error': 'Mission controller not available'
             }), 503
         
         result = mission_controller.set_mode(mode)
+        
+        # Log the result of mode change
+        if result.get('success', False):
+            log_message(f"Mission mode changed to: {mode.upper()}", "SUCCESS", event_type='mission')
+        else:
+            log_message(f"Failed to change mission mode to {mode}: {result.get('error')}", "ERROR", event_type='mission')
+        
         return jsonify(result)
         
     except Exception as exc:

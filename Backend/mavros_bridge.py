@@ -137,6 +137,22 @@ class MavrosBridge:
             raise ServiceError(f"Vehicle rejected arm value {value}: {response}")
         return response
 
+    def set_armed(self, value: bool, timeout: float = 5.0) -> Dict[str, Any]:
+        """Convenience method for mission controller compatibility. Arms or disarms the vehicle."""
+        try:
+            response = self.arm(value=value, timeout=timeout)
+            return {
+                'success': True,
+                'armed': value,
+                'response': response
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'armed': False,
+                'error': str(e)
+            }
+
     def set_mode(
         self,
         *,
