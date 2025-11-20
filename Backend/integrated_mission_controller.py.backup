@@ -54,14 +54,6 @@ class IntegratedMissionController:
         self.waypoint_reached_threshold = 2.0  # meters
         self.hold_duration = 5.0  # seconds
         self.mission_timeout = 300.0  # 5 minutes per waypoint
-
-        # Servo configuration (loaded from config file, can be overridden)
-        self.servo_enabled = True  # Enable servo control after hold
-        self.servo_channel = 9
-        self.servo_pwm_on = 600
-        self.servo_pwm_off = 1000
-        self.servo_spray_duration = 0.5  # Time between ON and OFF
-        self.servo_delay_after = 2.0  # Delay after OFF before continuing
         
         # Threading
         self.lock = threading.RLock()  # Use RLock to allow reentrant locking
@@ -696,64 +688,15 @@ class IntegratedMissionController:
             self.log(f'⏱ Starting {self.hold_duration}s hold period at waypoint {self.current_waypoint_index + 1}')
             self.hold_timer = threading.Timer(self.hold_duration, self.hold_period_complete)
             self.hold_timer.start()
-
-    def execute_servo_sequence(self):
-        """
-        Execute servo ON/OFF sequence after hold period.
-        Sequence: Servo ON → wait 0.5s → Servo OFF → wait 2s
-        """
-        try:
-            if not self.servo_enabled:
-                self.log('⚠ Servo control disabled - skipping servo sequence')
-                return
-
-            self.log(f'═══════════════════════════════════════════════════')
-            self.log(f'🎯 STARTING SERVO SEQUENCE')
-            self.log(f'Servo Channel: {self.servo_channel}')
-            self.log(f'═══════════════════════════════════════════════════')
-
-            # Step 1: Turn servo ON
-            self.log(f'📡 Setting servo {self.servo_channel} to {self.servo_pwm_on}µs (ON)')
-            response_on = self.bridge.set_servo(self.servo_channel, self.servo_pwm_on)
-
-            if response_on.get('success'):
-                self.log(f'✅ Servo ON: {self.servo_pwm_on}µs')
-            else:
-                self.log(f'⚠ Servo ON command sent (response: {response_on})', 'warning')
-
-            # Step 2: Wait spray duration (0.5 seconds)
-            self.log(f'⏱ Waiting {self.servo_spray_duration}s (spray duration)...')
-            time.sleep(self.servo_spray_duration)
-
-            # Step 3: Turn servo OFF
-            self.log(f'📡 Setting servo {self.servo_channel} to {self.servo_pwm_off}µs (OFF)')
-            response_off = self.bridge.set_servo(self.servo_channel, self.servo_pwm_off)
-
-            if response_off.get('success'):
-                self.log(f'✅ Servo OFF: {self.servo_pwm_off}µs')
-            else:
-                self.log(f'⚠ Servo OFF command sent (response: {response_off})', 'warning')
-
-            # Step 4: Wait delay after spray (2 seconds)
-            self.log(f'⏱ Waiting {self.servo_delay_after}s (post-spray delay)...')
-            time.sleep(self.servo_delay_after)
-
-            self.log(f'✅ SERVO SEQUENCE COMPLETE')
-            self.log(f'═══════════════════════════════════════════════════')
-
-        except Exception as e:
-            # Don't fail mission if servo fails - just log and continue
-            self.log(f'❌ Servo sequence error: {e}', 'error')
-            self.log(f'⚠ Continuing mission despite servo failure', 'warning')
-
+    
     def hold_period_complete(self):
         """Called when hold period is complete"""
         with self.lock:
             if self.mission_state != MissionState.RUNNING:
                 return
-
+            
             self.log(f'✓ Hold period complete for waypoint {self.current_waypoint_index + 1}')
-
+            
             # Emit waypoint_marked event indicating marking completed
             mark_time = datetime.now().isoformat() + "Z"
             self.emit_status(
@@ -769,15 +712,6 @@ class IntegratedMissionController:
                     "message": f"Waypoint {self.current_waypoint_index + 1} marking completed"
                 }
             )
-
-        # Execute servo sequence OUTSIDE the lock to prevent blocking
-        # This allows telemetry updates to continue during servo operations
-        self.execute_servo_sequence()
-
-        # Re-acquire lock for final waypoint progression logic
-        with self.lock:
-            if self.mission_state != MissionState.RUNNING:
-                return
 
             # Check mission mode
             if self.mission_mode == MissionMode.AUTO:

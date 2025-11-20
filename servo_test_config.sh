@@ -4,7 +4,7 @@
 
 # Servo channel to test (1-16, typically)
 # Common channels: 1-8 for main motors/control surfaces, 9-16 for aux functions
-SERVO_CHANNEL=10
+SERVO_CHANNEL=9
 
 # First PWM value in microseconds
 # Typical servo range: 1000-2000 μs

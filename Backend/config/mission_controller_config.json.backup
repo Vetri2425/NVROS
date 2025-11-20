@@ -1,12 +1,12 @@
 {
   "mission_controller": {
     "sprayer_parameters": {
-      "servo_channel": 9,
-      "servo_pwm_start": 600,
-      "servo_pwm_stop": 1000,
-      "spray_duration": 0.5,
+      "servo_channel": 10,
+      "servo_pwm_start": 1600,
+      "servo_pwm_stop": 1100,
+      "spray_duration": 5,
       "delay_before_spray": 1.5,
-      "delay_after_spray": 2.0,
+      "delay_after_spray": 1,
       "gps_timeout": 30,
       "auto_mode": true
     },
