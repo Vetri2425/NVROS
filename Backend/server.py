@@ -3100,7 +3100,14 @@ def api_mission_load_controller():
     Expected JSON body:
     {
         "waypoints": [{"lat": 13.071922, "lng": 80.2619957, ...}],
-        "servoConfig": {"mode": "interval", ...}  // optional
+        "servoConfig": {"mode": "interval", ...},  // optional
+        "servo_channel": 9,  // optional
+        "servo_pwm_on": 600,  // optional
+        "servo_pwm_off": 1000,  // optional
+        "servo_delay_before": 0.0,  // optional - delay BEFORE servo ON
+        "servo_spray_duration": 0.5,  // optional - time between ON/OFF
+        "servo_delay_after": 2.0,  // optional - delay AFTER servo OFF
+        "servo_enabled": true  // optional
     }
     """
     body = request.get_json(silent=True) or {}
@@ -3117,6 +3124,17 @@ def api_mission_load_controller():
     try:
         bridge = _require_vehicle_bridge()
         
+        # Build configuration with servo parameters
+        config = body.get('servoConfig', {}).copy() if body.get('servoConfig') else {}
+        
+        # Add servo parameters to config if provided in request
+        servo_params = ['servo_channel', 'servo_pwm_on', 'servo_pwm_off', 
+                       'servo_delay_before', 'servo_spray_duration', 'servo_delay_after', 'servo_enabled']
+        for param in servo_params:
+            if param in body:
+                config[param] = body[param]
+                log_message(f"[mission_load_controller] Setting {param}={body[param]}", "INFO")
+        
         # Apply servo configuration if provided
         servo_config = body.get('servoConfig')
         if servo_config:
@@ -3129,7 +3147,7 @@ def api_mission_load_controller():
         load_mission_data = {
             'command': 'load_mission',
             'waypoints': waypoints,
-            'config': servo_config or {}
+            'config': config
         }
         
         if hasattr(bridge, 'publish_mission_command'):
@@ -3437,6 +3455,75 @@ def api_mission_stop():
         return _http_success('Mission controller stopped')
     except Exception as exc:
         log_message(f"/api/mission/stop error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.post("/api/mission/servo_config")
+def api_mission_servo_config():
+    """
+    Update servo configuration dynamically without reloading mission.
+    
+    Expected JSON body:
+    {
+        "servo_channel": 9,  // optional
+        "servo_pwm_on": 600,  // optional
+        "servo_pwm_off": 1000,  // optional
+        "servo_delay_before": 0.0,  // optional - delay BEFORE turning servo ON
+        "servo_spray_duration": 0.5,  // optional - time between ON and OFF
+        "servo_delay_after": 2.0,  // optional - delay AFTER turning servo OFF
+        "servo_enabled": true  // optional
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    
+    if not body:
+        return _http_error("No configuration provided", 400)
+    
+    try:
+        global mission_controller
+        if not mission_controller:
+            return _http_error("Mission controller not initialized", 500)
+        
+        result = mission_controller.update_servo_config(body)
+        
+        if result.get('success'):
+            log_message(f"Servo config updated: {result.get('updated_params', [])}", "INFO")
+            return _http_success(
+                result.get('message', 'Servo configuration updated'),
+                updated_params=result.get('updated_params', [])
+            )
+        else:
+            return _http_error(result.get('error', 'Unknown error'), 400)
+            
+    except Exception as exc:
+        log_message(f"/api/mission/servo_config error: {exc}", "ERROR")
+        return _http_error(str(exc), 500)
+
+
+@app.get("/api/mission/servo_config")
+def api_mission_servo_config_get():
+    """
+    Get current servo configuration.
+    """
+    try:
+        global mission_controller
+        if not mission_controller:
+            return _http_error("Mission controller not initialized", 500)
+        
+        config = {
+            'servo_channel': mission_controller.servo_channel,
+            'servo_pwm_on': mission_controller.servo_pwm_on,
+            'servo_pwm_off': mission_controller.servo_pwm_off,
+            'servo_delay_before': mission_controller.servo_delay_before,
+            'servo_spray_duration': mission_controller.servo_spray_duration,
+            'servo_delay_after': mission_controller.servo_delay_after,
+            'servo_enabled': mission_controller.servo_enabled
+        }
+        
+        return _http_success(config)
+            
+    except Exception as exc:
+        log_message(f"/api/mission/servo_config GET error: {exc}", "ERROR")
         return _http_error(str(exc), 500)
 
 

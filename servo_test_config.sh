@@ -10,11 +10,11 @@ SERVO_CHANNEL=9
 # Typical servo range: 1000-2000 μs
 # Center position: ~1500 μs  
 # Use values appropriate for your servo/device
-FIRST_PWM=600
+FIRST_PWM=1750
 
 # Second PWM value in microseconds
 # Should be different from FIRST_PWM to observe movement
-SECOND_PWM=1000
+SECOND_PWM=2300
 
 # Delay between PWM changes in seconds
 # Allow time to observe servo movement

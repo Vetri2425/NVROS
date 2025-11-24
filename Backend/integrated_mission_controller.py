@@ -52,14 +52,15 @@ class IntegratedMissionController:
         
         # Configuration
         self.waypoint_reached_threshold = 2.0  # meters
-        self.hold_duration = 5.0  # seconds
+        self.hold_duration = 2.0  # seconds
         self.mission_timeout = 300.0  # 5 minutes per waypoint
 
         # Servo configuration (loaded from config file, can be overridden)
         self.servo_enabled = True  # Enable servo control after hold
         self.servo_channel = 9
-        self.servo_pwm_on = 600
-        self.servo_pwm_off = 1000
+        self.servo_pwm_on = 2300
+        self.servo_pwm_off = 1750
+        self.servo_delay_before = 0.0  # Delay BEFORE turning servo ON
         self.servo_spray_duration = 0.5  # Time between ON and OFF
         self.servo_delay_after = 2.0  # Delay after OFF before continuing
         
@@ -261,6 +262,51 @@ class IntegratedMissionController:
             self.log(error_msg, "error")
             return {'success': False, 'error': error_msg}
     
+    def update_servo_config(self, servo_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Update servo configuration dynamically"""
+        try:
+            updated_params = []
+            
+            if 'servo_channel' in servo_config:
+                self.servo_channel = int(servo_config['servo_channel'])
+                updated_params.append(f"servo_channel={self.servo_channel}")
+            
+            if 'servo_pwm_on' in servo_config:
+                self.servo_pwm_on = int(servo_config['servo_pwm_on'])
+                updated_params.append(f"servo_pwm_on={self.servo_pwm_on}")
+            
+            if 'servo_pwm_off' in servo_config:
+                self.servo_pwm_off = int(servo_config['servo_pwm_off'])
+                updated_params.append(f"servo_pwm_off={self.servo_pwm_off}")
+            
+            if 'servo_delay_before' in servo_config:
+                self.servo_delay_before = float(servo_config['servo_delay_before'])
+                updated_params.append(f"servo_delay_before={self.servo_delay_before}s")
+            
+            if 'servo_spray_duration' in servo_config:
+                self.servo_spray_duration = float(servo_config['servo_spray_duration'])
+                updated_params.append(f"servo_spray_duration={self.servo_spray_duration}s")
+            
+            if 'servo_delay_after' in servo_config:
+                self.servo_delay_after = float(servo_config['servo_delay_after'])
+                updated_params.append(f"servo_delay_after={self.servo_delay_after}s")
+            
+            if 'servo_enabled' in servo_config:
+                self.servo_enabled = bool(servo_config['servo_enabled'])
+                updated_params.append(f"servo_enabled={self.servo_enabled}")
+            
+            self.log(f"✓ Servo config updated: {', '.join(updated_params)}")
+            
+            return {
+                'success': True,
+                'message': 'Servo configuration updated',
+                'updated_params': updated_params
+            }
+        except Exception as e:
+            error_msg = f"Failed to update servo config: {str(e)}"
+            self.log(error_msg, "error")
+            return {'success': False, 'error': error_msg}
+    
     def load_mission(self, command_data: Dict[str, Any]) -> Dict[str, Any]:
         """Load waypoints and mission configuration"""
         with self.lock:
@@ -295,12 +341,20 @@ class IntegratedMissionController:
                 if 'auto_mode' in config:
                     self.mission_mode = MissionMode.AUTO if config['auto_mode'] else MissionMode.MANUAL
                 
+                # Update servo configuration if provided
+                if any(key.startswith('servo_') for key in config.keys()):
+                    servo_config = {k: v for k, v in config.items() if k.startswith('servo_')}
+                    self.update_servo_config(servo_config)
+                    self.log(f"✓ Applied servo configuration from load_mission")
+                
                 # Log mission load details
                 self.log(f'═══════════════════════════════════════════════════')
                 self.log(f'MISSION LOADED: {len(waypoints)} waypoints')
                 self.log(f'Mission Mode: {self.mission_mode.value}')
                 self.log(f'Waypoint Threshold: {self.waypoint_reached_threshold}m')
                 self.log(f'Hold Duration: {self.hold_duration}s')
+                self.log(f'Servo Config: channel={self.servo_channel}, pwm_on={self.servo_pwm_on}, pwm_off={self.servo_pwm_off}')
+                self.log(f'Servo Timing: before={self.servo_delay_before}s, spray={self.servo_spray_duration}s, after={self.servo_delay_after}s, enabled={self.servo_enabled}')
                 for i, wp in enumerate(waypoints, 1):
                     self.log(f'  WP{i}: lat={wp["lat"]:.6f}, lng={wp["lng"]:.6f}, alt={wp.get("alt", 10.0)}m')
                 self.log(f'═══════════════════════════════════════════════════')
@@ -700,7 +754,7 @@ class IntegratedMissionController:
     def execute_servo_sequence(self):
         """
         Execute servo ON/OFF sequence after hold period.
-        Sequence: Servo ON → wait 0.5s → Servo OFF → wait 2s
+        Sequence: Before delay → Servo ON → Spray duration → Servo OFF → After delay
         """
         try:
             if not self.servo_enabled:
@@ -712,7 +766,12 @@ class IntegratedMissionController:
             self.log(f'Servo Channel: {self.servo_channel}')
             self.log(f'═══════════════════════════════════════════════════')
 
-            # Step 1: Turn servo ON
+            # Step 1: Wait before delay (delay BEFORE turning servo ON)
+            if self.servo_delay_before > 0:
+                self.log(f'⏱ Waiting {self.servo_delay_before}s (pre-spray delay)...')
+                time.sleep(self.servo_delay_before)
+
+            # Step 2: Turn servo ON
             self.log(f'📡 Setting servo {self.servo_channel} to {self.servo_pwm_on}µs (ON)')
             response_on = self.bridge.set_servo(self.servo_channel, self.servo_pwm_on)
 
@@ -721,11 +780,11 @@ class IntegratedMissionController:
             else:
                 self.log(f'⚠ Servo ON command sent (response: {response_on})', 'warning')
 
-            # Step 2: Wait spray duration (0.5 seconds)
+            # Step 3: Wait spray duration (time between ON and OFF)
             self.log(f'⏱ Waiting {self.servo_spray_duration}s (spray duration)...')
             time.sleep(self.servo_spray_duration)
 
-            # Step 3: Turn servo OFF
+            # Step 4: Turn servo OFF
             self.log(f'📡 Setting servo {self.servo_channel} to {self.servo_pwm_off}µs (OFF)')
             response_off = self.bridge.set_servo(self.servo_channel, self.servo_pwm_off)
 
@@ -734,7 +793,7 @@ class IntegratedMissionController:
             else:
                 self.log(f'⚠ Servo OFF command sent (response: {response_off})', 'warning')
 
-            # Step 4: Wait delay after spray (2 seconds)
+            # Step 5: Wait delay after spray (before continuing to next waypoint)
             self.log(f'⏱ Waiting {self.servo_delay_after}s (post-spray delay)...')
             time.sleep(self.servo_delay_after)
 
